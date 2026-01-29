@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Iframe Proxy Test</title>
+  <style>
+    * {
+      box-sizing: border-box;
+    }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      margin: 0;
+      padding: 20px;
+      background: #f5f5f5;
+    }
+    h1 {
+      color: #333;
+    }
+    .container {
+      max-width: 1200px;
+      margin: 0 auto;
+    }
+    .controls {
+      background: white;
+      padding: 20px;
+      border-radius: 8px;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+      margin-bottom: 20px;
+    }
+    .input-group {
+      display: flex;
+      gap: 10px;
+      margin-bottom: 10px;
+    }
+    input[type="text"] {
+      flex: 1;
+      padding: 12px;
+      font-size: 16px;
+      border: 1px solid #ddd;
+      border-radius: 4px;
+    }
+    button {
+      padding: 12px 24px;
+      font-size: 16px;
+      background: #007bff;
+      color: white;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+    }
+    button:hover {
+      background: #0056b3;
+    }
+    .comparison {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 20px;
+    }
+    .frame-container {
+      background: white;
+      border-radius: 8px;
+      overflow: hidden;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    }
+    .frame-header {
+      padding: 10px 15px;
+      background: #f8f9fa;
+      border-bottom: 1px solid #eee;
+      font-weight: 600;
+    }
+    .frame-header.direct {
+      background: #fee;
+      color: #c00;
+    }
+    .frame-header.proxied {
+      background: #efe;
+      color: #060;
+    }
+    iframe {
+      width: 100%;
+      height: 500px;
+      border: none;
+    }
+    .error {
+      padding: 20px;
+      color: #c00;
+      text-align: center;
+    }
+    .info {
+      margin-top: 20px;
+      padding: 15px;
+      background: #e7f3ff;
+      border-radius: 8px;
+      font-size: 14px;
+      color: #0056b3;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>🔓 Iframe Bypass Proxy Test</h1>
+    
+    <div class="controls">
+      <div class="input-group">
+        <input type="text" id="urlInput" placeholder="Enter URL to embed (e.g., https://github.com)" value="https://github.com">
+        <button onclick="loadUrl()">Load in Iframes</button>
+      </div>
+      <small>Try sites that normally block iframes: github.com, wikipedia.org, etc.</small>
+    </div>
+    
+    <div class="comparison">
+      <div class="frame-container">
+        <div class="frame-header direct">❌ Direct Embed (usually blocked)</div>
+        <iframe id="directFrame" sandbox="allow-scripts allow-same-origin allow-forms"></iframe>
+      </div>
+      
+      <div class="frame-container">
+        <div class="frame-header proxied">✅ Via Proxy (should work)</div>
+        <iframe id="proxiedFrame" sandbox="allow-scripts allow-same-origin allow-forms"></iframe>
+      </div>
+    </div>
+    
+    <div class="info">
+      <strong>How it works:</strong> The proxy fetches the target page server-side, 
+      strips X-Frame-Options and CSP frame-ancestors headers, rewrites all URLs 
+      to go through the proxy, and injects JavaScript to handle frame-buster 
+      scripts and navigation.
+    </div>
+  </div>
+  
+  <script>
+    const PROXY_BASE = window.location.origin;
+    
+    function loadUrl() {
+      const url = document.getElementById('urlInput').value.trim();
+      if (!url) return alert('Please enter a URL');
+      
+      // Direct embed (will likely fail)
+      document.getElementById('directFrame').src = url;
+      
+      // Proxied embed (should work)
+      const proxyUrl = `${PROXY_BASE}/proxy?url=${encodeURIComponent(url)}`;
+      document.getElementById('proxiedFrame').src = proxyUrl;
+    }
+    
+    // Load default on page load
+    loadUrl();
+  </script>
+</body>
+</html>

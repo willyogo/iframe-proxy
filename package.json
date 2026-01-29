@@ -1,0 +1,26 @@
+{
+  "name": "iframe-proxy",
+  "version": "1.0.0",
+  "description": "Proxy server that enables embedding websites in iframes by bypassing X-Frame-Options and CSP restrictions",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test.js",
+    "dev": "node server.js"
+  },
+  "keywords": [
+    "proxy",
+    "iframe",
+    "x-frame-options",
+    "csp",
+    "embed"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "cheerio": "^1.0.0",
+    "cookie": "^0.7.0",
+    "express": "^4.21.0",
+    "node-fetch": "^2.7.0"
+  }
+}
