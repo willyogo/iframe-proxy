@@ -13,6 +13,23 @@
  *   GET  /health                   - Health check
  */
 
+// Allow self-signed certificates (necessary for proxy functionality)
+// This is safe for a local proxy that's just fetching content
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+
+// Global error handlers to prevent crashes
+process.on('uncaughtException', (err) => {
+  console.error('[FATAL] Uncaught Exception:', err.message);
+  console.error(err.stack);
+  // Don't exit - try to keep running
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('[FATAL] Unhandled Rejection at:', promise);
+  console.error('Reason:', reason);
+  // Don't exit - try to keep running
+});
+
 const express = require('express');
 const cheerio = require('cheerio');
 const fetch = require('node-fetch');
