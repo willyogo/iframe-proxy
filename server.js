@@ -88,6 +88,27 @@ function getProxyBase(req) {
 }
 
 /**
+ * Determine whether an incoming request is a top-level document navigation.
+ * Use fetch metadata where possible; fall back only when headers are missing.
+ */
+function isTopLevelNavigation(req) {
+  const accept = (req.headers['accept'] || '').toLowerCase();
+  const dest = (req.headers['sec-fetch-dest'] || '').toLowerCase();
+  const mode = (req.headers['sec-fetch-mode'] || '').toLowerCase();
+  const user = (req.headers['sec-fetch-user'] || '').toLowerCase();
+  const hasFetchMeta = Boolean(dest || mode || user);
+  
+  if (dest === 'document' || mode === 'navigate' || user === '?1') return true;
+  
+  // Conservative fallback when metadata is missing
+  if (!hasFetchMeta && req.method === 'GET') {
+    if (accept.includes('text/html') || accept.includes('application/xhtml+xml')) return true;
+  }
+  
+  return false;
+}
+
+/**
  * Unwrap a proxied URL back to its original target (handles nested proxy URLs)
  */
 function unwrapProxyUrl(possibleUrl, proxyBase) {
@@ -1267,49 +1288,32 @@ async function handleProxy(req, res) {
     }
   }
   
-  // Track the origin for this session (for catch-all routing of dynamic imports)
-  try {
-    const proxyOrigin = new URL(proxyBase).origin;
-    let targetOrigin = new URL(decodedUrl).origin;
-    
-    // If we somehow still have the proxy origin, try to recover from Referer
-    if (targetOrigin === proxyOrigin) {
-      const ref = req.headers['referer'] || req.headers['referrer'];
-      if (ref) {
-        const unwrappedRef = unwrapProxyUrl(ref, proxyBase);
-        try {
-          targetOrigin = new URL(unwrappedRef).origin;
-        } catch (e) {}
-      }
-    }
-    
-    // Only store non-proxy origins to avoid poisoning
-    if (targetOrigin && targetOrigin !== proxyOrigin) {
-      sessionOrigins.set(sessionId, targetOrigin);
-      lastGlobalOrigin = targetOrigin;
-    } else {
-      console.warn('[IframeProxy] Skipping proxy origin for session tracking:', targetOrigin);
-    }
-  } catch (e) {}
-  
   try {
     // Build request headers - make them as Chrome-like as possible
+    const acceptEncoding = (req.headers['accept-encoding'] || '').toLowerCase();
+    const safeEncoding = acceptEncoding.includes('br') ? 'gzip, deflate' : (acceptEncoding || 'gzip, deflate');
+    
     const headers = {
       'User-Agent': req.headers['user-agent'] || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
       'Accept': req.headers['accept'] || 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
       'Accept-Language': req.headers['accept-language'] || 'en-US,en;q=0.9',
-      'Accept-Encoding': 'identity', // Don't accept compressed responses for easier manipulation
+      'Accept-Encoding': safeEncoding,
       // Modern Chrome headers that help pass bot detection
-      'sec-ch-ua': '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
-      'sec-ch-ua-mobile': '?0',
-      'sec-ch-ua-platform': '"Windows"',
-      'sec-fetch-dest': 'document',
-      'sec-fetch-mode': 'navigate',
-      'sec-fetch-site': 'none',
-      'sec-fetch-user': '?1',
-      'upgrade-insecure-requests': '1',
-      'cache-control': 'max-age=0',
+      'sec-ch-ua': req.headers['sec-ch-ua'] || '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+      'sec-ch-ua-mobile': req.headers['sec-ch-ua-mobile'] || '?0',
+      'sec-ch-ua-platform': req.headers['sec-ch-ua-platform'] || '"Windows"',
+      'sec-fetch-dest': req.headers['sec-fetch-dest'],
+      'sec-fetch-mode': req.headers['sec-fetch-mode'],
+      'sec-fetch-site': req.headers['sec-fetch-site'],
+      'sec-fetch-user': req.headers['sec-fetch-user'],
+      'upgrade-insecure-requests': req.headers['upgrade-insecure-requests'],
+      'cache-control': req.headers['cache-control'] || 'max-age=0',
     };
+    
+    // Drop undefined headers to avoid sending "undefined"
+    for (const [key, value] of Object.entries(headers)) {
+      if (value === undefined) delete headers[key];
+    }
     
     // Add cookies
     const storedCookies = getCookiesForDomain(sessionId, decodedUrl);
@@ -1381,6 +1385,31 @@ async function handleProxy(req, res) {
     
     // Get content type
     const contentType = response.headers.get('content-type') || '';
+    
+    // Track the origin for this session only for top-level HTML documents
+    if (contentType.includes('text/html') && isTopLevelNavigation(req)) {
+      try {
+        const proxyOrigin = new URL(proxyBase).origin;
+        let targetOrigin = new URL(decodedUrl).origin;
+        
+        if (targetOrigin === proxyOrigin) {
+          const ref = req.headers['referer'] || req.headers['referrer'];
+          if (ref) {
+            const unwrappedRef = unwrapProxyUrl(ref, proxyBase);
+            try {
+              targetOrigin = new URL(unwrappedRef).origin;
+            } catch (e) {}
+          }
+        }
+        
+        if (targetOrigin && targetOrigin !== proxyOrigin) {
+          sessionOrigins.set(sessionId, targetOrigin);
+          lastGlobalOrigin = targetOrigin;
+        } else {
+          console.warn('[IframeProxy] Skipping proxy origin for session tracking:', targetOrigin);
+        }
+      } catch (e) {}
+    }
     
     // Get response body
     let body;
@@ -1482,6 +1511,17 @@ app.use(async (req, res, next) => {
     targetOrigin = lastGlobalOrigin;
   }
   
+  // If still missing, try to recover from Referer
+  if (!targetOrigin) {
+    const ref = req.headers['referer'] || req.headers['referrer'];
+    if (ref) {
+      try {
+        const unwrappedRef = unwrapProxyUrl(ref, getProxyBase(req));
+        targetOrigin = new URL(unwrappedRef).origin;
+      } catch (e) {}
+    }
+  }
+  
   // Avoid proxy-origin poisoning
   if (proxyOrigin && targetOrigin === proxyOrigin) {
     targetOrigin = lastGlobalOrigin && lastGlobalOrigin !== proxyOrigin ? lastGlobalOrigin : null;
@@ -1500,14 +1540,27 @@ app.use(async (req, res, next) => {
   const targetUrl = targetOrigin + path + queryString;
   
   // Check if this is a document/navigation request vs a resource request
-  const acceptHeader = req.headers['accept'] || '';
-  const isDocumentRequest = acceptHeader.includes('text/html') || 
-                            path === '/' || 
-                            !path.includes('.') ||
-                            path.match(/^\/[a-z0-9-]+$/i); // Simple paths like /portfolio, /chat
+  const acceptHeader = (req.headers['accept'] || '').toLowerCase();
+  const destHeader = (req.headers['sec-fetch-dest'] || '').toLowerCase();
+  const modeHeader = (req.headers['sec-fetch-mode'] || '').toLowerCase();
+  const urlHasRsc = req.url.includes('_rsc=') || req.url.includes('__rsc=') || req.url.includes('__flight__');
+  
+  let isDocRequest = false;
+  if (destHeader === 'document' || modeHeader === 'navigate') {
+    isDocRequest = true;
+  } else if (acceptHeader.includes('text/html') || acceptHeader.includes('application/xhtml+xml')) {
+    isDocRequest = true;
+  } else if (!destHeader && !modeHeader && !acceptHeader.includes('application/json') && !acceptHeader.includes('text/x-component')) {
+    // Fallback heuristics when fetch metadata is missing
+    isDocRequest = path === '/' || (!path.includes('.') && path.match(/^\/[a-z0-9-\/]+$/i));
+  }
   
   // For document requests (SPA navigation), redirect to proper proxy URL
-  if (isDocumentRequest && req.method === 'GET') {
+  if (urlHasRsc || acceptHeader.includes('text/x-component')) {
+    isDocRequest = false;
+  }
+  
+  if (isDocRequest && req.method === 'GET') {
     console.log('[IframeProxy] Redirecting SPA navigation:', path, '->', targetUrl);
     const proxyUrl = `/proxy?url=${encodeURIComponent(targetUrl)}${sessionId ? '&sid=' + sessionId : ''}`;
     return res.redirect(302, proxyUrl);
