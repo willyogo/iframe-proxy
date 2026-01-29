@@ -313,11 +313,26 @@ function rewriteHtml(html, targetUrl, proxyBase, sessionId) {
   });
   
   // Inject our frame-buster prevention and navigation interception script
+  // We need to ensure it runs BEFORE any other JavaScript, including inline scripts
   const injectedScript = generateInjectedScript(targetUrl, proxyBase, sessionId);
-  $('head').prepend(`<script>${injectedScript}</script>`);
   
-  // Get HTML output
+  // Get HTML output first
   let output = $.html();
+  
+  // Now inject our script at the VERY beginning of the document
+  // This ensures it runs before any other scripts, even those that capture fetch
+  // We inject it before the <!DOCTYPE> or <html> tag if possible
+  const scriptTag = `<script data-proxy-injected="true">${injectedScript}</script>`;
+  
+  // Find the best injection point - before <html> or at very start
+  const htmlMatch = output.match(/(<html[^>]*>)/i);
+  if (htmlMatch) {
+    const htmlPos = output.indexOf(htmlMatch[0]);
+    output = output.slice(0, htmlPos + htmlMatch[0].length) + scriptTag + output.slice(htmlPos + htmlMatch[0].length);
+  } else {
+    // Fallback: prepend to document
+    output = scriptTag + output;
+  }
   
   // Final pass: regex-based replacement for any remaining protocol-relative URLs
   // that cheerio might have missed (common with multiline attributes or edge cases)
@@ -351,6 +366,159 @@ function rewriteCssUrls(css, baseUrl, proxyBase, sessionId) {
 }
 
 /**
+ * Rewrite JavaScript to intercept fetch calls and route them through proxy
+ * This handles bundled code that captures fetch in module scope
+ */
+function rewriteJavaScript(js, baseUrl, proxyBase, sessionId) {
+  const targetOrigin = new URL(baseUrl).origin;
+  
+  // Known API domains that need to be proxied (add more as needed)
+  const API_DOMAINS_TO_PROXY = [
+    'api.katana.network',
+    'api.venice.ai',
+    'inference.venice.ai',
+    'api.coingecko.com',
+    'api.coinmarketcap.com',
+    'api.opensea.io',
+    'api.reservoir.tools',
+    'api.zapper.fi',
+    'api.zerion.io',
+  ];
+  
+  // RPC domains to exclude from proxying
+  const RPC_DOMAINS = [
+    'infura.io',
+    'alchemy.com', 
+    'quicknode.com',
+    'ankr.com',
+    'rpc.flashbots.net',
+  ];
+  
+  function shouldProxyDomain(url) {
+    for (const rpc of RPC_DOMAINS) {
+      if (url.includes(rpc)) return false;
+    }
+    return true;
+  }
+  
+  // Inject a wrapper at the beginning that provides proxied fetch
+  // This wrapper also captures fetch before any other code can
+  const wrapper = `
+;(function(){
+  if(window.__proxyFetchInstalled)return;
+  window.__proxyFetchInstalled=true;
+  var _origFetch=window.fetch&&window.fetch.bind(window);
+  var PROXY_BASE=${JSON.stringify(proxyBase)};
+  var SID=${JSON.stringify(sessionId)};
+  var TARGET_ORIGIN=${JSON.stringify(targetOrigin)};
+  var RPC_DOMAINS=['infura.io','alchemy.com','quicknode.com','ankr.com','flashbots.net'];
+  
+  function isRpcDomain(u){
+    for(var i=0;i<RPC_DOMAINS.length;i++){
+      if(u.indexOf(RPC_DOMAINS[i])!==-1)return true;
+    }
+    return false;
+  }
+  
+  function proxyUrl(u){
+    if(!u||typeof u!=='string')return u;
+    if(u.indexOf('/proxy?url=')!==-1)return u;
+    if(u.indexOf('data:')===0||u.indexOf('blob:')===0)return u;
+    if(isRpcDomain(u))return u;
+    var full=u;
+    if(u.indexOf('//')===0)full='https:'+u;
+    else if(u.indexOf('http')!==0){
+      if(u.indexOf('/')===0)full=TARGET_ORIGIN+u;
+      else return u;
+    }
+    return PROXY_BASE+'/proxy?url='+encodeURIComponent(full)+'&sid='+SID;
+  }
+  
+  // Create a proxy fetch function
+  function proxyFetch(input,init){
+    var url=typeof input==='string'?input:(input&&input.url?input.url:String(input));
+    var needsProxy=url&&(url.indexOf('http')===0||url.indexOf('//')===0)&&url.indexOf('/proxy?url=')===-1&&!isRpcDomain(url);
+    if(needsProxy){
+      var proxied=proxyUrl(url);
+      if(typeof input==='string')input=proxied;
+      else if(input&&input.url)input=new Request(proxied,input);
+    }
+    return _origFetch(input,init);
+  }
+  
+  // Override fetch
+  window.fetch=proxyFetch;
+  
+  // Also try to make it non-configurable to prevent overwriting
+  try{
+    Object.defineProperty(window,'fetch',{
+      value:proxyFetch,
+      writable:false,
+      configurable:false
+    });
+  }catch(e){}
+  
+  // Export for modules that might capture it
+  window.__proxyFetch=proxyFetch;
+})();
+`;
+
+  let rewritten = js;
+  
+  // STRATEGY 1: Rewrite API URL strings directly
+  // This ensures even concatenated URLs get proxied
+  for (const apiDomain of API_DOMAINS_TO_PROXY) {
+    // Replace "https://api.domain.com with proxied version
+    // Be careful to only replace full URLs, not partial matches
+    const patterns = [
+      // "https://api.domain.com" or 'https://api.domain.com'
+      new RegExp(`(["'\`])(https?:\\/\\/${apiDomain.replace(/\./g, '\\.')})(\\/[^"'\`]*)?\\1`, 'gi'),
+    ];
+    
+    for (const pattern of patterns) {
+      rewritten = rewritten.replace(pattern, (match, quote, baseUrl, path = '') => {
+        const fullUrl = baseUrl + path;
+        const proxiedUrl = toProxyUrl(fullUrl, proxyBase, sessionId);
+        return `${quote}${proxiedUrl}${quote}`;
+      });
+    }
+  }
+  
+  // STRATEGY 2: Replace fetch( calls with fully-qualified URLs
+  // Pattern: fetch("https://... or fetch('https://...
+  rewritten = rewritten.replace(
+    /fetch\s*\(\s*(["'])(https?:\/\/[^"']+)\1/gi,
+    (match, quote, url) => {
+      if (!shouldProxyDomain(url)) return match;
+      const proxiedUrl = toProxyUrl(url, proxyBase, sessionId);
+      return `fetch(${quote}${proxiedUrl}${quote}`;
+    }
+  );
+  
+  // STRATEGY 3: Catch template literal patterns: fetch(\`https://...
+  rewritten = rewritten.replace(
+    /fetch\s*\(\s*`(https?:\/\/[^`\$]+)`/gi,
+    (match, url) => {
+      if (!shouldProxyDomain(url)) return match;
+      const proxiedUrl = toProxyUrl(url, proxyBase, sessionId);
+      return `fetch(\`${proxiedUrl}\``;
+    }
+  );
+  
+  // STRATEGY 4: Replace new Request("https://...")
+  rewritten = rewritten.replace(
+    /new\s+Request\s*\(\s*(["'])(https?:\/\/[^"']+)\1/gi,
+    (match, quote, url) => {
+      if (!shouldProxyDomain(url)) return match;
+      const proxiedUrl = toProxyUrl(url, proxyBase, sessionId);
+      return `new Request(${quote}${proxiedUrl}${quote}`;
+    }
+  );
+
+  return wrapper + rewritten;
+}
+
+/**
  * Generate JavaScript to inject into the page for frame-buster prevention
  * and navigation interception
  */
@@ -364,14 +532,51 @@ function generateInjectedScript(targetUrl, proxyBase, sessionId) {
   const TARGET_ORIGIN = ${JSON.stringify(new URL(targetUrl).origin)};
   const TARGET_URL = ${JSON.stringify(targetUrl)};
   
-  // ===== PRESERVE WEB3 WALLET PROVIDERS =====
-  // Store reference to ethereum provider BEFORE any modifications
-  // This ensures MetaMask and other wallet extensions work
-  const _originalEthereum = window.ethereum;
-  const _originalWeb3 = window.web3;
+  console.log('[IframeProxy] Initializing for:', TARGET_ORIGIN);
   
-  // Prevent frame-busting by making window.top appear to be window.self
-  // but only for non-extension contexts
+  // ===== WEB3 WALLET PRESERVATION =====
+  // Critical: Don't interfere with wallet provider injection or communication
+  // Store references but don't modify
+  
+  // Domains that should NEVER be proxied (wallets, RPC, extensions)
+  const WALLET_BYPASS_DOMAINS = [
+    'walletconnect.org', 'walletconnect.com', 'bridge.walletconnect.org',
+    'relay.walletconnect.com', 'relay.walletconnect.org',
+    'verify.walletconnect.com', 'verify.walletconnect.org',
+    'rpc.walletconnect.com', 'rpc.walletconnect.org',
+    'explorer-api.walletconnect.com',
+    'infura.io', 'alchemy.com', 'quicknode.com', 'ankr.com',
+    'mainnet.optimism.io', 'arb1.arbitrum.io', 'polygon-rpc.com',
+    'cloudflare-eth.com', 'ethereum.publicnode.com',
+    'reown.com', 'reown.network', // Reown (WalletConnect rebrand)
+    'keys.coinbase.com', 'api.coinbase.com', // Coinbase Wallet
+    'metamask.io', 'portfolio.metamask.io', // MetaMask  
+    'auth.privy.io', 'privy.io', // Privy
+    'meshconnect.com', // Mesh
+    'porto.sh', // Porto
+    'safe.global', // Safe
+  ];
+  
+  const RPC_PATTERNS = ['/rpc', 'rpc.', '/v1/mainnet', '/v1/optimism', '/v1/arbitrum', '/v1/polygon'];
+  
+  function isWalletOrRpcUrl(url) {
+    if (!url) return false;
+    try {
+      const urlStr = url.toLowerCase();
+      // Check RPC patterns
+      for (const pattern of RPC_PATTERNS) {
+        if (urlStr.includes(pattern)) return true;
+      }
+      // Check wallet domains
+      const hostname = new URL(url.startsWith('//') ? 'https:' + url : url).hostname.toLowerCase();
+      for (const domain of WALLET_BYPASS_DOMAINS) {
+        if (hostname === domain || hostname.endsWith('.' + domain)) return true;
+      }
+      return false;
+    } catch(e) { return false; }
+  }
+  
+  // Prevent frame-busting but preserve window references for wallets
   try {
     if (window.top !== window.self) {
       Object.defineProperty(window, 'top', {
@@ -384,24 +589,6 @@ function generateInjectedScript(targetUrl, proxyBase, sessionId) {
       });
     }
   } catch(e) {}
-  
-  // Restore ethereum provider if it was overwritten
-  if (_originalEthereum && !window.ethereum) {
-    window.ethereum = _originalEthereum;
-  }
-  if (_originalWeb3 && !window.web3) {
-    window.web3 = _originalWeb3;
-  }
-  
-  // Watch for ethereum provider injection (extensions inject after page load)
-  let ethereumCheckCount = 0;
-  const ethereumWatcher = setInterval(() => {
-    ethereumCheckCount++;
-    // MetaMask typically injects within 100ms, but give it up to 5 seconds
-    if (ethereumCheckCount > 50 || window.ethereum) {
-      clearInterval(ethereumWatcher);
-    }
-  }, 100);
   
   // ===== URL REWRITING HELPERS =====
   
@@ -417,8 +604,10 @@ function generateInjectedScript(targetUrl, proxyBase, sessionId) {
   
   function shouldBypassProxy(url) {
     if (!url) return false;
+    // Always bypass wallet/RPC URLs
+    if (isWalletOrRpcUrl(url)) return true;
     try {
-      const hostname = new URL(url).hostname.toLowerCase();
+      const hostname = new URL(url.startsWith('//') ? 'https:' + url : url).hostname.toLowerCase();
       for (const cdn of CDN_PASSTHROUGH) {
         if (cdn.startsWith('.')) {
           if (hostname.endsWith(cdn)) return true;
@@ -426,7 +615,6 @@ function generateInjectedScript(targetUrl, proxyBase, sessionId) {
           if (hostname === cdn || hostname.endsWith('.' + cdn)) return true;
         }
       }
-      // Also bypass /cdn/ paths on same domain
       if (new URL(url).pathname.startsWith('/cdn/')) return true;
       return false;
     } catch(e) { return false; }
@@ -445,7 +633,6 @@ function generateInjectedScript(targetUrl, proxyBase, sessionId) {
       if (url.startsWith('/')) {
         url = TARGET_ORIGIN + url;
       } else if (!url.startsWith('data:') && !url.startsWith('javascript:') && !url.startsWith('mailto:') && !url.startsWith('tel:') && !url.startsWith('blob:') && !url.startsWith('#')) {
-        // Relative path - resolve against current path
         const base = TARGET_URL.replace(/\\/[^\\/]*$/, '/');
         url = base + url;
       } else {
@@ -458,7 +645,7 @@ function generateInjectedScript(targetUrl, proxyBase, sessionId) {
       return url;
     }
     
-    // Bypass proxy for CDN URLs
+    // Bypass proxy for CDN and wallet URLs
     if (shouldBypassProxy(url)) return url;
     
     return PROXY_BASE + '/proxy?url=' + encodeURIComponent(url) + '&sid=' + SESSION_ID;
@@ -477,140 +664,166 @@ function generateInjectedScript(targetUrl, proxyBase, sessionId) {
   }
   
   // ===== SPA HISTORY API INTERCEPTION =====
+  // This is CRITICAL for SPAs - must convert paths to proxy URLs
   
   // Track the "virtual" URL the app thinks it's at
   let virtualUrl = TARGET_URL;
+  window.__proxyVirtualUrl = virtualUrl; // Expose for debugging
   
-  // Store original history methods
-  const origPushState = history.pushState.bind(history);
-  const origReplaceState = history.replaceState.bind(history);
+  // Store original history methods IMMEDIATELY
+  const _origPushState = History.prototype.pushState;
+  const _origReplaceState = History.prototype.replaceState;
   
-  // Helper to convert a path to a proxy-compatible path (not full URL)
+  // Helper to convert a path to a proxy-compatible path
   function toProxyPath(url) {
     if (!url) return url;
+    if (typeof url !== 'string') url = String(url);
     
-    // If it's already a full proxy URL, extract just the path part for history
-    if (typeof url === 'string' && url.includes('/proxy?url=')) {
-      // Keep it as-is since it's already a proxy path
+    // Already a proxy path
+    if (url.includes('/proxy?url=')) {
       return url.startsWith('http') ? new URL(url).pathname + new URL(url).search : url;
     }
     
-    // For relative paths, keep them relative to proxy
-    if (typeof url === 'string') {
-      if (url.startsWith('/') && !url.startsWith('//')) {
-        // Absolute path - convert to proxy path
-        return '/proxy?url=' + encodeURIComponent(TARGET_ORIGIN + url) + '&sid=' + SESSION_ID;
-      }
-      if (!url.startsWith('http://') && !url.startsWith('https://') && !url.startsWith('//')) {
-        // Relative path
-        const base = new URL(virtualUrl).pathname.replace(/\\/[^\\/]*$/, '/');
-        return '/proxy?url=' + encodeURIComponent(TARGET_ORIGIN + base + url) + '&sid=' + SESSION_ID;
-      }
-      if (url.startsWith('http://') || url.startsWith('https://') || url.startsWith('//')) {
-        // Full URL - proxy it
-        const fullUrl = url.startsWith('//') ? 'https:' + url : url;
-        return '/proxy?url=' + encodeURIComponent(fullUrl) + '&sid=' + SESSION_ID;
+    // Absolute path starting with /
+    if (url.startsWith('/') && !url.startsWith('//')) {
+      const fullUrl = TARGET_ORIGIN + url;
+      console.log('[IframeProxy] toProxyPath:', url, '->', fullUrl);
+      return '/proxy?url=' + encodeURIComponent(fullUrl) + '&sid=' + SESSION_ID;
+    }
+    
+    // Relative path (no leading /)
+    if (!url.startsWith('http://') && !url.startsWith('https://') && !url.startsWith('//')) {
+      try {
+        const resolved = new URL(url, virtualUrl).href;
+        return '/proxy?url=' + encodeURIComponent(resolved) + '&sid=' + SESSION_ID;
+      } catch(e) {
+        return url;
       }
     }
+    
+    // Full URL
+    if (url.startsWith('http://') || url.startsWith('https://') || url.startsWith('//')) {
+      const fullUrl = url.startsWith('//') ? 'https:' + url : url;
+      return '/proxy?url=' + encodeURIComponent(fullUrl) + '&sid=' + SESSION_ID;
+    }
+    
     return url;
   }
   
-  // Override pushState for SPA navigation
-  history.pushState = function(state, title, url) {
+  // Override on prototype to catch ALL pushState calls
+  History.prototype.pushState = function(state, title, url) {
+    console.log('[IframeProxy] pushState called with:', url);
     if (url) {
       try {
-        // Resolve the virtual URL for tracking
+        // Update virtual URL tracking
         const resolvedUrl = new URL(url, virtualUrl).href;
         virtualUrl = resolvedUrl;
+        window.__proxyVirtualUrl = virtualUrl;
         
-        // Convert to a proxy-compatible path (same origin as current doc)
+        // Convert to proxy path
         const proxyPath = toProxyPath(url);
-        const enhancedState = { ...state, __virtualUrl: resolvedUrl };
-        origPushState(enhancedState, title, proxyPath);
+        console.log('[IframeProxy] pushState converted to:', proxyPath);
         
-        window.dispatchEvent(new CustomEvent('proxy:navigate', { detail: { url: resolvedUrl } }));
+        const enhancedState = Object.assign({}, state || {}, { __virtualUrl: resolvedUrl });
+        return _origPushState.call(this, enhancedState, title, proxyPath);
       } catch(e) {
         console.warn('[IframeProxy] pushState error:', e);
-        origPushState(state, title, url);
+        return _origPushState.call(this, state, title, url);
       }
-    } else {
-      origPushState(state, title, url);
     }
+    return _origPushState.call(this, state, title, url);
   };
   
-  // Override replaceState for SPA navigation  
-  history.replaceState = function(state, title, url) {
+  // Override replaceState on prototype
+  History.prototype.replaceState = function(state, title, url) {
+    console.log('[IframeProxy] replaceState called with:', url);
     if (url) {
       try {
         const resolvedUrl = new URL(url, virtualUrl).href;
         virtualUrl = resolvedUrl;
+        window.__proxyVirtualUrl = virtualUrl;
         
         const proxyPath = toProxyPath(url);
-        const enhancedState = { ...state, __virtualUrl: resolvedUrl };
-        origReplaceState(enhancedState, title, proxyPath);
+        console.log('[IframeProxy] replaceState converted to:', proxyPath);
+        
+        const enhancedState = Object.assign({}, state || {}, { __virtualUrl: resolvedUrl });
+        return _origReplaceState.call(this, enhancedState, title, proxyPath);
       } catch(e) {
         console.warn('[IframeProxy] replaceState error:', e);
-        origReplaceState(state, title, url);
+        return _origReplaceState.call(this, state, title, url);
       }
-    } else {
-      origReplaceState(state, title, url);
     }
+    return _origReplaceState.call(this, state, title, url);
   };
   
   // Handle popstate (back/forward navigation)
   window.addEventListener('popstate', function(e) {
     if (e.state && e.state.__virtualUrl) {
       virtualUrl = e.state.__virtualUrl;
+      window.__proxyVirtualUrl = virtualUrl;
+      console.log('[IframeProxy] popstate updated virtualUrl:', virtualUrl);
     }
   });
   
   // ===== LOCATION INTERCEPTION =====
   
-  // Override window.location.assign and replace
   const origAssign = window.location.assign.bind(window.location);
   const origReplace = window.location.replace.bind(window.location);
   
   window.location.assign = function(url) {
+    console.log('[IframeProxy] location.assign:', url);
     origAssign(toProxyUrl(url));
   };
   
   window.location.replace = function(url) {
+    console.log('[IframeProxy] location.replace:', url);
     origReplace(toProxyUrl(url));
   };
   
   // ===== FETCH INTERCEPTION =====
+  // Keep it writable so wallet libraries can wrap it if needed
   
-  const origFetch = window.fetch;
-  window.fetch = function(input, init) {
+  const _origFetch = window.fetch.bind(window);
+  
+  function proxyFetch(input, init) {
+    const originalUrl = typeof input === 'string' ? input : (input instanceof Request ? input.url : String(input));
+    
+    // NEVER proxy wallet/RPC URLs
+    if (isWalletOrRpcUrl(originalUrl)) {
+      console.log('[IframeProxy] fetch BYPASS (wallet/RPC):', originalUrl);
+      return _origFetch(input, init);
+    }
+    
+    // Check if this needs proxying
+    const needsProxy = originalUrl && (
+      originalUrl.startsWith('http://') || 
+      originalUrl.startsWith('https://') || 
+      originalUrl.startsWith('//')
+    ) && !originalUrl.includes('/proxy?url=') && !originalUrl.startsWith(PROXY_BASE) && !shouldBypassProxy(originalUrl);
+    
     let url = input;
-    if (typeof input === 'string') {
-      url = toProxyUrl(input);
-    } else if (input instanceof Request) {
-      url = new Request(toProxyUrl(input.url), input);
+    if (needsProxy) {
+      const proxiedUrl = toProxyUrl(originalUrl);
+      if (typeof input === 'string') {
+        url = proxiedUrl;
+      } else if (input instanceof Request) {
+        url = new Request(proxiedUrl, input);
+      }
+      console.log('[IframeProxy] fetch PROXY:', originalUrl, '->', proxiedUrl);
+    } else {
+      console.log('[IframeProxy] fetch DIRECT:', originalUrl);
     }
     
     init = init || {};
     init.credentials = init.credentials || 'include';
     
-    // Don't modify headers for wallet/web3 requests
-    const originalUrl = typeof input === 'string' ? input : input.url;
-    const isWeb3Request = originalUrl && (
-      originalUrl.includes('infura.io') ||
-      originalUrl.includes('alchemy.com') ||
-      originalUrl.includes('rpc.') ||
-      originalUrl.includes('/rpc')
-    );
-    
-    if (!isWeb3Request) {
-      init.headers = init.headers || {};
-      if (!(init.headers instanceof Headers)) {
-        init.headers = new Headers(init.headers);
-      }
-      init.headers.set('X-Proxy-Session', SESSION_ID);
-    }
-    
-    return origFetch(url, init);
-  };
+    return _origFetch(url, init);
+  }
+  
+  // Override fetch but keep it WRITABLE for wallet libraries
+  window.fetch = proxyFetch;
+  window.__origFetch = _origFetch;
+  window.__proxyFetch = proxyFetch;
   
   // ===== XHR INTERCEPTION =====
   
@@ -664,40 +877,65 @@ function generateInjectedScript(targetUrl, proxyBase, sessionId) {
     const link = e.target.closest('a[href]');
     if (link) {
       const href = link.getAttribute('href');
-      // Don't intercept wallet connect links
-      if (href && href.includes('metamask') || href && href.includes('walletconnect')) {
+      if (!href) return;
+      
+      // Don't intercept wallet/web3 links
+      if (href.includes('metamask') || href.includes('walletconnect') || 
+          href.includes('coinbase') || href.includes('rainbow') ||
+          href.includes('wc:') || href.startsWith('ethereum:')) {
+        console.log('[IframeProxy] click BYPASS (wallet link):', href);
         return;
       }
-      if (href && !href.startsWith('javascript:') && !href.startsWith('#') && !href.includes('/proxy?url=')) {
-        e.preventDefault();
-        e.stopPropagation();
-        
-        // Check if it's same-origin (SPA navigation) vs cross-origin
-        let resolvedUrl;
-        try {
-          resolvedUrl = new URL(href, virtualUrl).href;
-        } catch(err) {
-          resolvedUrl = href;
-        }
-        
-        // For same-origin, try to let SPA routers handle it
+      
+      // Skip special URLs
+      if (href.startsWith('javascript:') || href.startsWith('#') || href.includes('/proxy?url=')) {
+        return;
+      }
+      
+      // Resolve the URL
+      let resolvedUrl;
+      try {
+        resolvedUrl = new URL(href, virtualUrl).href;
+      } catch(err) {
+        resolvedUrl = href;
+      }
+      
+      // Check if it's same-origin (SPA navigation)
+      try {
         const resolvedOrigin = new URL(resolvedUrl).origin;
         if (resolvedOrigin === TARGET_ORIGIN) {
-          // Simulate click for SPA routers that intercept events
-          const pathname = new URL(resolvedUrl).pathname + new URL(resolvedUrl).search + new URL(resolvedUrl).hash;
-          
-          // Try pushState first (for SPAs)
-          history.pushState({}, '', pathname);
-          
-          // Dispatch events that SPA routers listen for
-          window.dispatchEvent(new PopStateEvent('popstate', { state: {} }));
+          // Same-origin: Let the SPA router handle it via our pushState override
+          // Don't prevent default - let the natural click flow through
+          // Our History.prototype.pushState override will catch it
+          console.log('[IframeProxy] click same-origin, letting SPA router handle:', href);
+          return; // Let it propagate naturally
         } else {
-          // Cross-origin - do full navigation
+          // Cross-origin: Prevent and redirect through proxy
+          e.preventDefault();
+          e.stopPropagation();
+          console.log('[IframeProxy] click cross-origin, proxying:', resolvedUrl);
           window.location.href = toProxyUrl(resolvedUrl);
         }
+      } catch(err) {
+        console.warn('[IframeProxy] click handler error:', err);
       }
     }
   }, true);
+  
+  // ===== WEBSOCKET PRESERVATION =====
+  // Don't interfere with WebSocket connections - wallets use these
+  // The native WebSocket should work fine, just log for debugging
+  const _OrigWebSocket = window.WebSocket;
+  window.WebSocket = function(url, protocols) {
+    console.log('[IframeProxy] WebSocket connection:', url);
+    // Never proxy WebSocket URLs
+    return new _OrigWebSocket(url, protocols);
+  };
+  window.WebSocket.prototype = _OrigWebSocket.prototype;
+  window.WebSocket.CONNECTING = _OrigWebSocket.CONNECTING;
+  window.WebSocket.OPEN = _OrigWebSocket.OPEN;
+  window.WebSocket.CLOSING = _OrigWebSocket.CLOSING;
+  window.WebSocket.CLOSED = _OrigWebSocket.CLOSED;
   
   // ===== DYNAMIC IMAGE LOADING (MutationObserver) =====
   
@@ -916,8 +1154,12 @@ async function handleProxy(req, res) {
     } else if (contentType.includes('text/css')) {
       const css = await response.text();
       body = rewriteCssUrls(css, decodedUrl, proxyBase, sessionId);
-    } else if (contentType.includes('javascript') || contentType.includes('application/json')) {
-      // For JS/JSON, we pass through as-is (our injected script handles dynamic URLs)
+    } else if (contentType.includes('javascript')) {
+      // Rewrite JavaScript to proxy fetch calls
+      const js = await response.text();
+      body = rewriteJavaScript(js, decodedUrl, proxyBase, sessionId);
+    } else if (contentType.includes('application/json')) {
+      // JSON passes through as-is
       body = await response.buffer();
     } else {
       // Binary content (images, fonts, etc.) - pass through
