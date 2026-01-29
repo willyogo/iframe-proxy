@@ -46,6 +46,10 @@ const cookieJar = new Map();
 const sessionOrigins = new Map();
 let lastGlobalOrigin = null; // Fallback for requests without session
 
+// Proxy context cookies (help route same-origin subresource requests)
+const PROXY_CTX_SID_COOKIE = '__proxy_sid';
+const PROXY_CTX_ORIGIN_COOKIE = '__proxy_origin';
+
 // Middleware
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
@@ -85,6 +89,36 @@ function getProxyBase(req) {
   const protocol = req.headers['x-forwarded-proto'] || req.protocol || 'http';
   const host = req.headers['x-forwarded-host'] || req.headers.host;
   return `${protocol}://${host}`;
+}
+
+function safeDecode(value) {
+  if (!value) return value;
+  try {
+    return decodeURIComponent(value);
+  } catch (e) {
+    return value;
+  }
+}
+
+function getProxyContextFromCookies(req) {
+  const raw = req.headers['cookie'] || '';
+  if (!raw) return {};
+  const parsed = cookieModule.parse(raw);
+  return {
+    sid: safeDecode(parsed[PROXY_CTX_SID_COOKIE]),
+    origin: safeDecode(parsed[PROXY_CTX_ORIGIN_COOKIE]),
+  };
+}
+
+function setProxyContextCookies(res, req, sessionId, origin) {
+  if (!sessionId) return;
+  const proto = req.headers['x-forwarded-proto'] || req.protocol || 'http';
+  const secureFlag = proto === 'https' ? '; Secure' : '';
+  const base = `Path=/; SameSite=Lax${secureFlag}`;
+  res.append('Set-Cookie', `${PROXY_CTX_SID_COOKIE}=${encodeURIComponent(sessionId)}; ${base}`);
+  if (origin) {
+    res.append('Set-Cookie', `${PROXY_CTX_ORIGIN_COOKIE}=${encodeURIComponent(origin)}; ${base}`);
+  }
 }
 
 /**
@@ -1348,8 +1382,14 @@ async function handleProxy(req, res) {
       headers['Cookie'] = formatCookies(storedCookies);
     }
     
-    // Forward referer as the target origin
-    headers['Referer'] = new URL(decodedUrl).origin;
+    // Forward referer as the unwrapped target URL when possible
+    const rawRef = req.headers['referer'] || req.headers['referrer'];
+    if (rawRef) {
+      const unwrappedRef = unwrapProxyUrl(rawRef, proxyBase);
+      headers['Referer'] = unwrappedRef;
+    } else {
+      headers['Referer'] = new URL(decodedUrl).origin;
+    }
     headers['Origin'] = new URL(decodedUrl).origin;
     
     // Build fetch options - use manual redirect to keep redirects within proxy
@@ -1413,6 +1453,8 @@ async function handleProxy(req, res) {
     // Get content type
     const contentType = response.headers.get('content-type') || '';
     
+    let contextOriginForCookie = null;
+    
     // Track the origin for this session only for top-level HTML documents
     if (contentType.includes('text/html') && isTopLevelNavigation(req)) {
       try {
@@ -1432,6 +1474,7 @@ async function handleProxy(req, res) {
         if (targetOrigin && targetOrigin !== proxyOrigin) {
           sessionOrigins.set(sessionId, targetOrigin);
           lastGlobalOrigin = targetOrigin;
+          contextOriginForCookie = targetOrigin;
         } else {
           console.warn('[IframeProxy] Skipping proxy origin for session tracking:', targetOrigin);
         }
@@ -1477,6 +1520,7 @@ async function handleProxy(req, res) {
     // Always set these headers
     res.setHeader('X-Proxy-Session', sessionId);
     res.setHeader('Access-Control-Allow-Origin', '*');
+    setProxyContextCookies(res, req, sessionId, contextOriginForCookie);
     
     res.status(response.status);
     res.send(body);
@@ -1526,7 +1570,11 @@ app.use(async (req, res, next) => {
   }
   
   // Try to get the origin from session or fallback
-  const sessionId = req.query.sid || req.headers['x-proxy-session'];
+  let sessionId = req.query.sid || req.headers['x-proxy-session'];
+  const ctxCookies = getProxyContextFromCookies(req);
+  if (!sessionId && ctxCookies.sid) {
+    sessionId = ctxCookies.sid;
+  }
   let targetOrigin = sessionId ? sessionOrigins.get(sessionId) : null;
   let proxyOrigin = null;
   try {
@@ -1545,6 +1593,10 @@ app.use(async (req, res, next) => {
   
   if (refererOrigin && (!proxyOrigin || refererOrigin !== proxyOrigin)) {
     targetOrigin = refererOrigin;
+  }
+  
+  if (!targetOrigin && ctxCookies.origin && (!proxyOrigin || ctxCookies.origin !== proxyOrigin)) {
+    targetOrigin = ctxCookies.origin;
   }
   
   // Fallback to last global origin (works for single-site testing)
