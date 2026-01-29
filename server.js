@@ -191,11 +191,54 @@ function rewriteHtml(html, targetUrl, proxyBase, sessionId) {
     }
   });
   
+  // Rewrite <noscript> tags (cheerio treats their content as text)
+  $('noscript').each((i, el) => {
+    let content = $(el).html();
+    if (content) {
+      // Rewrite src, href, data-src attributes in noscript content
+      content = content.replace(/(src|href|data-src|data-href|action|poster)=(["'])((?:\/\/|https?:\/\/)[^"']+)\2/gi, 
+        (match, attr, quote, url) => {
+          let resolvedUrl = url;
+          if (url.startsWith('//')) {
+            resolvedUrl = 'https:' + url;
+          }
+          const proxiedUrl = toProxyUrl(resolvedUrl, proxyBase, sessionId);
+          return `${attr}=${quote}${proxiedUrl}${quote}`;
+        }
+      );
+      // Also handle protocol-relative URLs without quotes (rare but possible)
+      content = content.replace(/(src|href|data-src)=(\/\/[^\s>]+)/gi,
+        (match, attr, url) => {
+          const resolvedUrl = 'https:' + url;
+          const proxiedUrl = toProxyUrl(resolvedUrl, proxyBase, sessionId);
+          return `${attr}="${proxiedUrl}"`;
+        }
+      );
+      $(el).html(content);
+    }
+  });
+  
   // Inject our frame-buster prevention and navigation interception script
   const injectedScript = generateInjectedScript(targetUrl, proxyBase, sessionId);
   $('head').prepend(`<script>${injectedScript}</script>`);
   
-  return $.html();
+  // Get HTML output
+  let output = $.html();
+  
+  // Final pass: regex-based replacement for any remaining protocol-relative URLs
+  // that cheerio might have missed (common with multiline attributes or edge cases)
+  const urlAttrs = ['src', 'href', 'data-src', 'data-href', 'action', 'poster', 'srcset', 'data-srcset'];
+  for (const attr of urlAttrs) {
+    // Match attr="//..." or attr='//...'
+    const regex = new RegExp(`(${attr})=(["'])(\/\/[^"']+)\\2`, 'gi');
+    output = output.replace(regex, (match, attrName, quote, url) => {
+      const fullUrl = 'https:' + url;
+      const proxiedUrl = toProxyUrl(fullUrl, proxyBase, sessionId);
+      return `${attrName}=${quote}${proxiedUrl}${quote}`;
+    });
+  }
+  
+  return output;
 }
 
 /**
@@ -368,23 +411,17 @@ function sanitizeResponseHeaders(headers) {
   for (const [key, value] of Object.entries(headers)) {
     const lowerKey = key.toLowerCase();
     
-    // Skip headers that prevent iframe embedding
+    // Skip headers that prevent iframe embedding or restrict content loading
     if (lowerKey === 'x-frame-options') continue;
-    if (lowerKey === 'content-security-policy') {
-      // Remove frame-ancestors and adjust other directives
-      let csp = value;
-      csp = csp.replace(/frame-ancestors[^;]*(;|$)/gi, '');
-      // Also relax script-src to allow our injected script
-      if (!csp.includes("'unsafe-inline'")) {
-        csp = csp.replace(/script-src/gi, "script-src 'unsafe-inline'");
-      }
-      if (csp.trim()) {
-        sanitized['content-security-policy'] = csp;
-      }
-      continue;
-    }
+    // Remove CSP entirely - it causes too many issues with proxied content
+    // since all URLs are rewritten to go through the proxy
+    if (lowerKey === 'content-security-policy') continue;
     if (lowerKey === 'content-security-policy-report-only') continue;
     if (lowerKey === 'x-content-type-options') continue;
+    // Remove cross-origin policies that might interfere
+    if (lowerKey === 'cross-origin-embedder-policy') continue;
+    if (lowerKey === 'cross-origin-opener-policy') continue;
+    if (lowerKey === 'cross-origin-resource-policy') continue;
     
     // Keep other headers
     sanitized[key] = value;
@@ -450,12 +487,22 @@ async function handleProxy(req, res) {
   const proxyBase = getProxyBase(req);
   
   try {
-    // Build request headers
+    // Build request headers - make them as Chrome-like as possible
     const headers = {
-      'User-Agent': req.headers['user-agent'] || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      'Accept': req.headers['accept'] || 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-      'Accept-Language': req.headers['accept-language'] || 'en-US,en;q=0.5',
+      'User-Agent': req.headers['user-agent'] || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+      'Accept': req.headers['accept'] || 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+      'Accept-Language': req.headers['accept-language'] || 'en-US,en;q=0.9',
       'Accept-Encoding': 'identity', // Don't accept compressed responses for easier manipulation
+      // Modern Chrome headers that help pass bot detection
+      'sec-ch-ua': '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+      'sec-ch-ua-mobile': '?0',
+      'sec-ch-ua-platform': '"Windows"',
+      'sec-fetch-dest': 'document',
+      'sec-fetch-mode': 'navigate',
+      'sec-fetch-site': 'none',
+      'sec-fetch-user': '?1',
+      'upgrade-insecure-requests': '1',
+      'cache-control': 'max-age=0',
     };
     
     // Add cookies
