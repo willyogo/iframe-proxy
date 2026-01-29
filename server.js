@@ -56,6 +56,12 @@ const PROXY_BASE_DOMAIN = process.env.PROXY_BASE_DOMAIN || '';
 // Track starting URL per session (used by SDK/session creation)
 const sessionStartUrls = new Map();
 
+// Simple in-memory cache for static assets
+const ASSET_CACHE_TTL_MS = parseInt(process.env.ASSET_CACHE_TTL_MS || '600000', 10); // 10 min
+const ASSET_CACHE_MAX_BYTES = parseInt(process.env.ASSET_CACHE_MAX_BYTES || String(50 * 1024 * 1024), 10); // 50MB
+const assetCache = new Map(); // url -> { body, contentType, cacheControl, status, ts, size }
+let assetCacheBytes = 0;
+
 // Middleware
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
@@ -167,6 +173,68 @@ function setProxyContextCookies(res, req, sessionId, origin) {
   if (origin) {
     res.append('Set-Cookie', `${PROXY_CTX_ORIGIN_COOKIE}=${encodeURIComponent(origin)}; ${base}`);
   }
+}
+
+function isCacheableRequest(req) {
+  if (req.method !== 'GET') return false;
+  if (req.headers['range']) return false;
+  if (req.headers['authorization']) return false;
+  return true;
+}
+
+function hasSensitiveQuery(urlObj) {
+  const sensitiveKeys = ['token', 'auth', 'signature', 'sig', 'expires', 'jwt', 'access_token', 'id_token'];
+  for (const key of sensitiveKeys) {
+    if (urlObj.searchParams.has(key)) return true;
+  }
+  return false;
+}
+
+function isCacheableUrl(urlString) {
+  try {
+    const u = new URL(urlString);
+    const path = u.pathname.toLowerCase();
+    if (hasSensitiveQuery(u)) return false;
+    if (path.includes('/_next/static/') || path.includes('/static/')) return true;
+    const exts = ['.js', '.css', '.woff2', '.woff', '.ttf', '.otf', '.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.ico', '.glb', '.gltf', '.map'];
+    return exts.some(ext => path.endsWith(ext));
+  } catch (e) {
+    return false;
+  }
+}
+
+function isCacheableContentType(contentType) {
+  const ct = (contentType || '').toLowerCase();
+  if (ct.includes('text/html') || ct.includes('application/json') || ct.includes('text/x-component')) return false;
+  if (ct.includes('text/css') || ct.includes('javascript')) return true;
+  if (ct.startsWith('image/') || ct.startsWith('font/') || ct.startsWith('model/')) return true;
+  return false;
+}
+
+function getCachedAsset(urlString) {
+  const entry = assetCache.get(urlString);
+  if (!entry) return null;
+  if (Date.now() - entry.ts > ASSET_CACHE_TTL_MS) {
+    assetCache.delete(urlString);
+    assetCacheBytes -= entry.size;
+    return null;
+  }
+  return entry;
+}
+
+function setCachedAsset(urlString, entry) {
+  if (!entry || !entry.body || !entry.size) return;
+  if (entry.size > ASSET_CACHE_MAX_BYTES) return;
+  // Evict oldest entries until there's room
+  while (assetCacheBytes + entry.size > ASSET_CACHE_MAX_BYTES && assetCache.size > 0) {
+    const oldestKey = assetCache.keys().next().value;
+    if (!oldestKey) break;
+    const oldest = assetCache.get(oldestKey);
+    assetCache.delete(oldestKey);
+    if (oldest && oldest.size) assetCacheBytes -= oldest.size;
+  }
+  assetCache.set(urlString, entry);
+  assetCacheBytes += entry.size;
 }
 
 /**
@@ -1499,6 +1567,18 @@ async function handleProxy(req, res) {
       }
     }
     
+    // Serve from cache if possible
+    if (isCacheableRequest(req) && isCacheableUrl(decodedUrl)) {
+      const cached = getCachedAsset(decodedUrl);
+      if (cached) {
+        if (cached.contentType) res.setHeader('Content-Type', cached.contentType);
+        if (cached.cacheControl) res.setHeader('Cache-Control', cached.cacheControl);
+        res.setHeader('X-Proxy-Session', sessionId);
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        return res.status(cached.status || 200).send(cached.body);
+      }
+    }
+    
     // Fetch the target URL
     let response = await fetch(decodedUrl, fetchOptions);
     
@@ -1559,6 +1639,9 @@ async function handleProxy(req, res) {
           sessionOrigins.set(sessionId, targetOrigin);
           lastGlobalOrigin = targetOrigin;
           contextOriginForCookie = targetOrigin;
+          if (!sessionStartUrls.has(sessionId)) {
+            sessionStartUrls.set(sessionId, decodedUrl);
+          }
         } else {
           console.warn('[IframeProxy] Skipping proxy origin for session tracking:', targetOrigin);
         }
@@ -1605,6 +1688,19 @@ async function handleProxy(req, res) {
     res.setHeader('X-Proxy-Session', sessionId);
     res.setHeader('Access-Control-Allow-Origin', '*');
     setProxyContextCookies(res, req, sessionId, contextOriginForCookie);
+    
+    // Cache static assets (post-rewrite) for subsequent requests
+    if (response.status === 200 && isCacheableRequest(req) && isCacheableUrl(decodedUrl) && isCacheableContentType(contentType)) {
+      const bufferBody = Buffer.isBuffer(body) ? body : Buffer.from(body);
+      setCachedAsset(decodedUrl, {
+        body: bufferBody,
+        contentType,
+        cacheControl: sanitizedHeaders['cache-control'],
+        status: response.status,
+        ts: Date.now(),
+        size: bufferBody.length
+      });
+    }
     
     res.status(response.status);
     res.send(body);
@@ -1672,6 +1768,7 @@ app.post('/session', (req, res) => {
     sessionId,
     sessionUrl: proxyUrl,
     proxyUrl,
+    rootUrl: `${sessionBase}/`,
     targetUrl: decodedUrl,
     targetOrigin
   });
@@ -1682,6 +1779,18 @@ app.get('/health', (req, res) => {
 });
 
 app.get('/', (req, res) => {
+  const sessionHostId = getSessionIdFromHost(req);
+  if (PROXY_BASE_DOMAIN && sessionHostId) {
+    const startUrl = sessionStartUrls.get(sessionHostId);
+    const ctx = getProxyContextFromCookies(req);
+    const fallback = ctx.origin || null;
+    const target = startUrl || fallback;
+    if (target) {
+      const proxyUrl = `/proxy?url=${encodeURIComponent(target)}`;
+      return res.redirect(302, proxyUrl);
+    }
+  }
+  
   res.json({
     name: 'Iframe Bypass Proxy',
     version: '1.0.0',
@@ -1788,6 +1897,16 @@ app.use(async (req, res, next) => {
   console.log('[IframeProxy] Proxying resource:', path, '->', targetUrl);
   
   try {
+    if (isCacheableRequest(req) && isCacheableUrl(targetUrl)) {
+      const cached = getCachedAsset(targetUrl);
+      if (cached) {
+        if (cached.contentType) res.setHeader('Content-Type', cached.contentType);
+        if (cached.cacheControl) res.setHeader('Cache-Control', cached.cacheControl);
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        return res.status(cached.status || 200).send(cached.body);
+      }
+    }
+    
     const headers = {
       'User-Agent': req.headers['user-agent'] || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
       'Accept': req.headers['accept'] || '*/*',
@@ -1821,6 +1940,17 @@ app.use(async (req, res, next) => {
     
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.status(response.status).send(body);
+    
+    if (response.status === 200 && isCacheableRequest(req) && isCacheableUrl(targetUrl) && isCacheableContentType(contentType)) {
+      setCachedAsset(targetUrl, {
+        body,
+        contentType,
+        cacheControl,
+        status: response.status,
+        ts: Date.now(),
+        size: body.length
+      });
+    }
     
   } catch (error) {
     console.error('[IframeProxy] Catch-all error:', targetUrl, error.message);

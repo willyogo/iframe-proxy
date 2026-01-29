@@ -65,6 +65,7 @@ POST /session
   "sessionId": "session_...",
   "sessionUrl": "https://<session>.<yourdomain>/proxy?url=https%3A%2F%2Fapp.katana.network",
   "proxyUrl": "https://<session>.<yourdomain>/proxy?url=...",
+  "rootUrl": "https://<session>.<yourdomain>/",
   "targetUrl": "https://app.katana.network",
   "targetOrigin": "https://app.katana.network"
 }
@@ -158,7 +159,9 @@ setTimeout(() => {
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `PORT`   | 3001    | Server port |
-| `PROXY_BASE_DOMAIN` | (empty) | Base domain for per-session subdomains (e.g. `lvh.me` for local dev). When set, `sid` is omitted from proxied URLs. |
+| `PROXY_BASE_DOMAIN` | (empty) | Base domain for per-session subdomains (e.g. `lvh.me` for local dev). When set, `sid` is omitted from proxied URLs and the session root `https://<session>.<domain>/` loads the start URL. |
+| `ASSET_CACHE_TTL_MS` | 600000 | TTL for static asset cache (ms) |
+| `ASSET_CACHE_MAX_BYTES` | 52428800 | Max memory for static asset cache |
 
 ## Development
 
