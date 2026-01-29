@@ -1264,11 +1264,11 @@ async function handleProxy(req, res) {
     headers['Referer'] = new URL(decodedUrl).origin;
     headers['Origin'] = new URL(decodedUrl).origin;
     
-    // Build fetch options
+    // Build fetch options - use manual redirect to keep redirects within proxy
     const fetchOptions = {
       method: req.method,
       headers,
-      redirect: 'follow',
+      redirect: 'manual', // Handle redirects ourselves to keep them proxied
     };
     
     // Handle POST body
@@ -1288,7 +1288,33 @@ async function handleProxy(req, res) {
     }
     
     // Fetch the target URL
-    const response = await fetch(decodedUrl, fetchOptions);
+    let response = await fetch(decodedUrl, fetchOptions);
+    
+    // Handle redirects - keep them within the proxy
+    let redirectCount = 0;
+    const maxRedirects = 10;
+    while (response.status >= 300 && response.status < 400 && redirectCount < maxRedirects) {
+      const location = response.headers.get('location');
+      if (!location) break;
+      
+      // Resolve relative redirects
+      const redirectUrl = new URL(location, decodedUrl).href;
+      console.log('[IframeProxy] Following redirect:', decodedUrl, '->', redirectUrl);
+      
+      // Update the decoded URL for subsequent processing
+      decodedUrl = redirectUrl;
+      
+      // Fetch the redirect target
+      response = await fetch(redirectUrl, { 
+        ...fetchOptions, 
+        headers: {
+          ...headers,
+          'Referer': new URL(redirectUrl).origin,
+          'Origin': new URL(redirectUrl).origin,
+        }
+      });
+      redirectCount++;
+    }
     
     // Store any cookies from the response
     const setCookieHeader = response.headers.raw()['set-cookie'];
@@ -1372,8 +1398,8 @@ app.get('/', (req, res) => {
   });
 });
 
-// Catch-all for dynamic imports (Next.js, etc.)
-// Routes like /_next/static/chunks/... need to be proxied to the original site
+// Catch-all for SPA navigation and dynamic imports
+// When browser navigates to /portfolio, redirect to /proxy?url=https://site.com/portfolio
 app.use(async (req, res, next) => {
   const path = req.path;
   
@@ -1392,11 +1418,33 @@ app.use(async (req, res, next) => {
   }
   
   if (!targetOrigin) {
-    return res.status(404).json({ error: 'No origin context available for catch-all proxy' });
+    return res.status(404).json({ 
+      success: false, 
+      error: 'No origin context - please load a site through /proxy?url= first',
+      path: path 
+    });
   }
   
-  // Proxy this path to the target origin
-  const targetUrl = targetOrigin + path + (req.url.includes('?') ? req.url.slice(req.url.indexOf('?')) : '');
+  // Build the full target URL
+  const queryString = req.url.includes('?') ? req.url.slice(req.url.indexOf('?')) : '';
+  const targetUrl = targetOrigin + path + queryString;
+  
+  // Check if this is a document/navigation request vs a resource request
+  const acceptHeader = req.headers['accept'] || '';
+  const isDocumentRequest = acceptHeader.includes('text/html') || 
+                            path === '/' || 
+                            !path.includes('.') ||
+                            path.match(/^\/[a-z0-9-]+$/i); // Simple paths like /portfolio, /chat
+  
+  // For document requests (SPA navigation), redirect to proper proxy URL
+  if (isDocumentRequest && req.method === 'GET') {
+    console.log('[IframeProxy] Redirecting SPA navigation:', path, '->', targetUrl);
+    const proxyUrl = `/proxy?url=${encodeURIComponent(targetUrl)}${sessionId ? '&sid=' + sessionId : ''}`;
+    return res.redirect(302, proxyUrl);
+  }
+  
+  // For resource requests (JS, CSS, images), proxy directly
+  console.log('[IframeProxy] Proxying resource:', path, '->', targetUrl);
   
   try {
     const headers = {
@@ -1408,10 +1456,23 @@ app.use(async (req, res, next) => {
     };
     
     const response = await fetch(targetUrl, { headers, redirect: 'follow' });
+    
+    // Check if the response is HTML (might be a soft 404 or redirect)
+    const contentType = response.headers.get('content-type') || '';
+    
+    // If we got HTML for a resource request, it might be an error page - proxy it properly
+    if (contentType.includes('text/html') && !isDocumentRequest) {
+      const html = await response.text();
+      const proxyBase = getProxyBase(req);
+      const rewritten = rewriteHtml(html, targetUrl, proxyBase, sessionId || 'default');
+      res.setHeader('Content-Type', 'text/html; charset=utf-8');
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      return res.status(response.status).send(rewritten);
+    }
+    
     const body = await response.buffer();
     
     // Forward relevant headers
-    const contentType = response.headers.get('content-type');
     if (contentType) res.setHeader('Content-Type', contentType);
     
     const cacheControl = response.headers.get('cache-control');
@@ -1422,7 +1483,13 @@ app.use(async (req, res, next) => {
     
   } catch (error) {
     console.error('[IframeProxy] Catch-all error:', targetUrl, error.message);
-    res.status(500).json({ error: 'Catch-all proxy error', details: error.message });
+    res.status(500).json({ 
+      success: false,
+      error: 'Proxy error', 
+      details: error.message,
+      path: path,
+      targetUrl: targetUrl
+    });
   }
 });
 
