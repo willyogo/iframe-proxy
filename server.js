@@ -540,24 +540,54 @@ function generateInjectedScript(targetUrl, proxyBase, sessionId) {
   
   // Domains that should NEVER be proxied (wallets, RPC, extensions)
   const WALLET_BYPASS_DOMAINS = [
+    // WalletConnect
     'walletconnect.org', 'walletconnect.com', 'bridge.walletconnect.org',
     'relay.walletconnect.com', 'relay.walletconnect.org',
     'verify.walletconnect.com', 'verify.walletconnect.org',
     'rpc.walletconnect.com', 'rpc.walletconnect.org',
-    'explorer-api.walletconnect.com',
-    'infura.io', 'alchemy.com', 'quicknode.com', 'ankr.com',
+    'explorer-api.walletconnect.com', 'pulse.walletconnect.com',
+    'push.walletconnect.com', 'echo.walletconnect.com',
+    // Reown (WalletConnect rebrand)
+    'reown.com', 'reown.network', 'api.reown.com',
+    'keys.reown.com', 'verify.reown.com', 'rpc.reown.com',
+    // RPC Providers
+    'infura.io', 'alchemy.com', 'quicknode.com', 'ankr.com', 'llamarpc.com',
     'mainnet.optimism.io', 'arb1.arbitrum.io', 'polygon-rpc.com',
-    'cloudflare-eth.com', 'ethereum.publicnode.com',
-    'reown.com', 'reown.network', // Reown (WalletConnect rebrand)
-    'keys.coinbase.com', 'api.coinbase.com', // Coinbase Wallet
-    'metamask.io', 'portfolio.metamask.io', // MetaMask  
-    'auth.privy.io', 'privy.io', // Privy
-    'meshconnect.com', // Mesh
-    'porto.sh', // Porto
-    'safe.global', // Safe
+    'cloudflare-eth.com', 'ethereum.publicnode.com', 'base.org',
+    'rpc.linea.build', 'zksync.io', 'blast.io',
+    // MetaMask
+    'metamask.io', 'portfolio.metamask.io', 'api.cx.metamask.io',
+    'gas-api.metaswap.codefi.network', 'token-api.metaswap.codefi.network',
+    'phishing-detection.metaswap.codefi.network', 'codefi.network',
+    // Coinbase
+    'keys.coinbase.com', 'api.coinbase.com', 'coinbase.com',
+    'wallet.coinbase.com', 'rpc.wallet.coinbase.com',
+    // Privy
+    'auth.privy.io', 'privy.io', 'api.privy.io',
+    // Other wallets
+    'meshconnect.com', 'api.mesh.id', 'mesh.id',
+    'porto.sh', 'api.porto.sh',
+    'safe.global', 'safe.io', 'gnosis-safe.io',
+    'rainbow.me', 'api.rainbow.me',
+    'phantom.app', 'api.phantom.app',
+    'trustwallet.com', 'api.trustwallet.com',
+    // Blockchain explorers and APIs commonly used by wallets
+    'etherscan.io', 'api.etherscan.io',
+    'polygonscan.com', 'api.polygonscan.com',
+    'arbiscan.io', 'api.arbiscan.io',
+    'optimistic.etherscan.io',
+    'basescan.org', 'api.basescan.org',
+    // Other services
+    'socket.tech', 'api.socket.tech', // Bridge aggregator
+    'li.fi', 'api.li.fi', // Another bridge
+    '1inch.io', 'api.1inch.io', // DEX aggregator
+    '0x.org', 'api.0x.org', // 0x protocol
   ];
   
-  const RPC_PATTERNS = ['/rpc', 'rpc.', '/v1/mainnet', '/v1/optimism', '/v1/arbitrum', '/v1/polygon'];
+  const RPC_PATTERNS = [
+    '/rpc', 'rpc.', '/v1/mainnet', '/v1/optimism', '/v1/arbitrum', '/v1/polygon',
+    '/eth/', 'eth_', 'jsonrpc', 'web3', '/v1/base', '/v1/linea', '/v1/zksync',
+  ];
   
   function isWalletOrRpcUrl(url) {
     if (!url) return false;
@@ -765,20 +795,112 @@ function generateInjectedScript(targetUrl, proxyBase, sessionId) {
     }
   });
   
-  // ===== LOCATION INTERCEPTION =====
+  // ===== LOCATION VIRTUALIZATION =====
+  // Critical: SPAs check location.pathname to decide what to render
+  // We need to make it return the virtual path, not /proxy?url=...
   
-  const origAssign = window.location.assign.bind(window.location);
-  const origReplace = window.location.replace.bind(window.location);
+  const _realLocation = window.location;
   
-  window.location.assign = function(url) {
-    console.log('[IframeProxy] location.assign:', url);
-    origAssign(toProxyUrl(url));
-  };
+  // Create a virtual location that returns the "app" URL, not proxy URL
+  function getVirtualLocation() {
+    try {
+      const vUrl = new URL(virtualUrl);
+      return {
+        href: virtualUrl,
+        protocol: vUrl.protocol,
+        host: vUrl.host,
+        hostname: vUrl.hostname,
+        port: vUrl.port,
+        pathname: vUrl.pathname,
+        search: vUrl.search,
+        hash: _realLocation.hash, // Hash is local, not sent to server
+        origin: vUrl.origin,
+        ancestorOrigins: _realLocation.ancestorOrigins,
+        // Methods that need proxying
+        assign: function(url) {
+          console.log('[IframeProxy] location.assign:', url);
+          _realLocation.assign(toProxyUrl(new URL(url, virtualUrl).href));
+        },
+        replace: function(url) {
+          console.log('[IframeProxy] location.replace:', url);
+          _realLocation.replace(toProxyUrl(new URL(url, virtualUrl).href));
+        },
+        reload: function() {
+          _realLocation.reload();
+        },
+        toString: function() {
+          return virtualUrl;
+        }
+      };
+    } catch(e) {
+      console.warn('[IframeProxy] getVirtualLocation error:', e);
+      return _realLocation;
+    }
+  }
   
-  window.location.replace = function(url) {
-    console.log('[IframeProxy] location.replace:', url);
-    origReplace(toProxyUrl(url));
-  };
+  // Try to override window.location with a proxy
+  // This is tricky because location is a special object
+  try {
+    // Method 1: Define property on window (works in some contexts)
+    const locationProxy = new Proxy(_realLocation, {
+      get: function(target, prop) {
+        const vLoc = getVirtualLocation();
+        if (prop in vLoc) {
+          const val = vLoc[prop];
+          if (typeof val === 'function') {
+            return val.bind(vLoc);
+          }
+          return val;
+        }
+        // Fallback to real location for unknown props
+        const realVal = target[prop];
+        if (typeof realVal === 'function') {
+          return realVal.bind(target);
+        }
+        return realVal;
+      },
+      set: function(target, prop, value) {
+        console.log('[IframeProxy] location.' + prop + ' =', value);
+        if (prop === 'href') {
+          target.href = toProxyUrl(new URL(value, virtualUrl).href);
+          return true;
+        }
+        if (prop === 'pathname') {
+          target.href = toProxyUrl(TARGET_ORIGIN + value);
+          return true;
+        }
+        target[prop] = value;
+        return true;
+      }
+    });
+    
+    Object.defineProperty(window, 'location', {
+      get: function() { return locationProxy; },
+      set: function(val) { 
+        console.log('[IframeProxy] window.location =', val);
+        _realLocation.href = toProxyUrl(new URL(val, virtualUrl).href);
+      },
+      configurable: true
+    });
+    console.log('[IframeProxy] Location virtualization: SUCCESS');
+  } catch(e) {
+    console.warn('[IframeProxy] Could not virtualize window.location:', e);
+    // Fallback: just override methods
+    try {
+      const origAssign = _realLocation.assign.bind(_realLocation);
+      const origReplace = _realLocation.replace.bind(_realLocation);
+      _realLocation.assign = function(url) {
+        origAssign(toProxyUrl(new URL(url, virtualUrl).href));
+      };
+      _realLocation.replace = function(url) {
+        origReplace(toProxyUrl(new URL(url, virtualUrl).href));
+      };
+    } catch(e2) {}
+  }
+  
+  // Also provide a helper for apps that need the real location
+  window.__realLocation = _realLocation;
+  window.__getVirtualLocation = getVirtualLocation;
   
   // ===== FETCH INTERCEPTION =====
   // Keep it writable so wallet libraries can wrap it if needed
@@ -829,23 +951,30 @@ function generateInjectedScript(targetUrl, proxyBase, sessionId) {
   
   const origXHROpen = XMLHttpRequest.prototype.open;
   XMLHttpRequest.prototype.open = function(method, url, ...args) {
-    this.__proxyUrl = url; // Store for later
-    return origXHROpen.call(this, method, toProxyUrl(url), ...args);
+    this.__originalUrl = url; // Store original URL
+    
+    // Check if this should bypass proxy (wallet/RPC)
+    if (isWalletOrRpcUrl(url) || shouldBypassProxy(url)) {
+      console.log('[IframeProxy] XHR BYPASS:', url);
+      this.__bypassProxy = true;
+      return origXHROpen.call(this, method, url, ...args);
+    }
+    
+    // Proxy the URL
+    const proxiedUrl = toProxyUrl(url);
+    console.log('[IframeProxy] XHR PROXY:', url, '->', proxiedUrl);
+    this.__bypassProxy = false;
+    return origXHROpen.call(this, method, proxiedUrl, ...args);
   };
   
   const origXHRSend = XMLHttpRequest.prototype.send;
   XMLHttpRequest.prototype.send = function(body) {
-    try {
-      // Don't add header for web3 RPC requests
-      const isWeb3 = this.__proxyUrl && (
-        this.__proxyUrl.includes('infura.io') ||
-        this.__proxyUrl.includes('alchemy.com') ||
-        this.__proxyUrl.includes('rpc.')
-      );
-      if (!isWeb3) {
+    // Don't add session header for bypassed requests
+    if (!this.__bypassProxy) {
+      try {
         this.setRequestHeader('X-Proxy-Session', SESSION_ID);
-      }
-    } catch(e) {}
+      } catch(e) {}
+    }
     return origXHRSend.call(this, body);
   };
   
@@ -853,7 +982,14 @@ function generateInjectedScript(targetUrl, proxyBase, sessionId) {
   
   const origOpen = window.open;
   window.open = function(url, target, features) {
-    return origOpen(toProxyUrl(url), target, features);
+    // Don't proxy wallet-related popups
+    if (url && (isWalletOrRpcUrl(url) || shouldBypassProxy(url))) {
+      console.log('[IframeProxy] window.open BYPASS:', url);
+      return origOpen(url, target, features);
+    }
+    const proxiedUrl = toProxyUrl(url);
+    console.log('[IframeProxy] window.open PROXY:', url, '->', proxiedUrl);
+    return origOpen(proxiedUrl, target, features);
   };
   
   // ===== FORM SUBMISSION INTERCEPTION =====
