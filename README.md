@@ -42,7 +42,7 @@ POST /proxy?url=<encoded-url>  (for form submissions)
 
 **Parameters:**
 - `url` (required): URL-encoded target URL
-- `sid` (optional): Session ID for cookie isolation
+- `sid` (optional): Session ID for cookie isolation (not needed when using session subdomains)
 
 **Example:**
 ```bash
@@ -158,7 +158,7 @@ setTimeout(() => {
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `PORT`   | 3001    | Server port |
-| `PROXY_BASE_DOMAIN` | (empty) | Base domain for per-session subdomains (e.g. `lvh.me` for local dev) |
+| `PROXY_BASE_DOMAIN` | (empty) | Base domain for per-session subdomains (e.g. `lvh.me` for local dev). When set, `sid` is omitted from proxied URLs. |
 
 ## Development
 

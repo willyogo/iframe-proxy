@@ -324,7 +324,18 @@ function toProxyUrl(targetUrl, proxyBase, sessionId) {
   
   try {
     const encoded = encodeURIComponent(targetUrl);
-    return `${proxyBase}/proxy?url=${encoded}&sid=${sessionId}`;
+    let appendSid = true;
+    if (PROXY_BASE_DOMAIN) {
+      try {
+        const host = new URL(proxyBase).hostname.toLowerCase();
+        const base = PROXY_BASE_DOMAIN.toLowerCase();
+        const isSessionHost = host !== base && host.endsWith('.' + base);
+        appendSid = !isSessionHost;
+      } catch (e) {
+        appendSid = true;
+      }
+    }
+    return `${proxyBase}/proxy?url=${encoded}${appendSid ? `&sid=${sessionId}` : ''}`;
   } catch (e) {
     return targetUrl;
   }
@@ -577,8 +588,10 @@ function rewriteJavaScript(js, baseUrl, proxyBase, sessionId) {
   var _origFetch=g.fetch.bind(g);
   var PROXY_BASE=${JSON.stringify(proxyBase)};
   var SID=${JSON.stringify(sessionId)};
+  var BASE_DOMAIN=${JSON.stringify(PROXY_BASE_DOMAIN || '')};
   var TARGET_ORIGIN=${JSON.stringify(targetOrigin)};
   var RPC_DOMAINS=['infura.io','alchemy.com','quicknode.com','ankr.com','flashbots.net'];
+  var USE_SESSION_SUBDOMAIN=!!(BASE_DOMAIN && g.location && g.location.hostname && g.location.hostname!==BASE_DOMAIN && g.location.hostname.endsWith('.'+BASE_DOMAIN));
   
   function isRpcDomain(u){
     for(var i=0;i<RPC_DOMAINS.length;i++){
@@ -614,7 +627,7 @@ function rewriteJavaScript(js, baseUrl, proxyBase, sessionId) {
         full=remap.href;
       }
     }catch(e){}
-    return PROXY_BASE+'/proxy?url='+encodeURIComponent(full)+'&sid='+SID;
+    return PROXY_BASE+'/proxy?url='+encodeURIComponent(full)+(USE_SESSION_SUBDOMAIN?'':'&sid='+SID);
   }
   
   // Create a proxy fetch function
@@ -661,6 +674,7 @@ function generateInjectedScript(targetUrl, proxyBase, sessionId) {
   
   const PROXY_BASE = ${JSON.stringify(proxyBase)};
   const SESSION_ID = ${JSON.stringify(sessionId)};
+  const PROXY_BASE_DOMAIN = ${JSON.stringify(PROXY_BASE_DOMAIN || '')};
   const TARGET_ORIGIN = ${JSON.stringify(new URL(targetUrl).origin)};
   const TARGET_URL = ${JSON.stringify(targetUrl)};
   
@@ -830,7 +844,9 @@ function generateInjectedScript(targetUrl, proxyBase, sessionId) {
     // Bypass proxy for CDN and wallet URLs
     if (shouldBypassProxy(url)) return url;
     
-    return PROXY_BASE + '/proxy?url=' + encodeURIComponent(url) + '&sid=' + SESSION_ID;
+    const useSubdomain = PROXY_BASE_DOMAIN && window.location.hostname !== PROXY_BASE_DOMAIN &&
+      window.location.hostname.endsWith('.' + PROXY_BASE_DOMAIN);
+    return PROXY_BASE + '/proxy?url=' + encodeURIComponent(url) + (useSubdomain ? '' : '&sid=' + SESSION_ID);
   }
   
   // Convert proxied URL back to original URL
@@ -873,14 +889,18 @@ function generateInjectedScript(targetUrl, proxyBase, sessionId) {
     if (url.startsWith('/') && !url.startsWith('//')) {
       const fullUrl = TARGET_ORIGIN + url;
       console.log('[IframeProxy] toProxyPath:', url, '->', fullUrl);
-      return '/proxy?url=' + encodeURIComponent(fullUrl) + '&sid=' + SESSION_ID;
+      const useSubdomain = PROXY_BASE_DOMAIN && window.location.hostname !== PROXY_BASE_DOMAIN &&
+        window.location.hostname.endsWith('.' + PROXY_BASE_DOMAIN);
+      return '/proxy?url=' + encodeURIComponent(fullUrl) + (useSubdomain ? '' : '&sid=' + SESSION_ID);
     }
     
     // Relative path (no leading /)
     if (!url.startsWith('http://') && !url.startsWith('https://') && !url.startsWith('//')) {
       try {
         const resolved = new URL(url, virtualUrl).href;
-        return '/proxy?url=' + encodeURIComponent(resolved) + '&sid=' + SESSION_ID;
+        const useSubdomain = PROXY_BASE_DOMAIN && window.location.hostname !== PROXY_BASE_DOMAIN &&
+          window.location.hostname.endsWith('.' + PROXY_BASE_DOMAIN);
+        return '/proxy?url=' + encodeURIComponent(resolved) + (useSubdomain ? '' : '&sid=' + SESSION_ID);
       } catch(e) {
         return url;
       }
@@ -889,7 +909,9 @@ function generateInjectedScript(targetUrl, proxyBase, sessionId) {
     // Full URL
     if (url.startsWith('http://') || url.startsWith('https://') || url.startsWith('//')) {
       const fullUrl = url.startsWith('//') ? 'https:' + url : url;
-      return '/proxy?url=' + encodeURIComponent(fullUrl) + '&sid=' + SESSION_ID;
+      const useSubdomain = PROXY_BASE_DOMAIN && window.location.hostname !== PROXY_BASE_DOMAIN &&
+        window.location.hostname.endsWith('.' + PROXY_BASE_DOMAIN);
+      return '/proxy?url=' + encodeURIComponent(fullUrl) + (useSubdomain ? '' : '&sid=' + SESSION_ID);
     }
     
     return url;
@@ -1757,7 +1779,8 @@ app.use(async (req, res, next) => {
   
   if (isDocRequest && req.method === 'GET') {
     console.log('[IframeProxy] Redirecting SPA navigation:', path, '->', targetUrl);
-    const proxyUrl = `/proxy?url=${encodeURIComponent(targetUrl)}${sessionId ? '&sid=' + sessionId : ''}`;
+    const includeSid = !(PROXY_BASE_DOMAIN && isSessionHost(req, sessionId));
+    const proxyUrl = `/proxy?url=${encodeURIComponent(targetUrl)}${includeSid && sessionId ? '&sid=' + sessionId : ''}`;
     return res.redirect(302, proxyUrl);
   }
   
