@@ -82,6 +82,8 @@ Returns: `{ "status": "ok", "timestamp": "..." }`
 
 Visit `http://localhost:3001/test.html` to see a side-by-side comparison of direct embedding vs proxied embedding.
 
+Visit `http://localhost:3001/nounspace-toggle-test.html` to test the widget-style toggle flow (session creation + iframe swapping).
+
 ## Integration with nounspace.com
 
 To use this proxy for "load via proxy" functionality with a toggle:

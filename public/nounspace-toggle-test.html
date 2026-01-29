@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Nounspace Proxy Toggle Test</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      padding: 24px;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: #f7f7f9;
+      color: #111;
+    }
+    h1 { margin: 0 0 6px; }
+    .container { max-width: 1200px; margin: 0 auto; }
+    .card {
+      background: #fff;
+      border-radius: 10px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+      padding: 16px;
+      margin-bottom: 16px;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+    }
+    label { font-size: 13px; color: #555; display: block; margin-bottom: 6px; }
+    input[type="text"] {
+      width: 100%;
+      padding: 10px 12px;
+      border: 1px solid #ddd;
+      border-radius: 6px;
+      font-size: 14px;
+    }
+    .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+    button {
+      padding: 10px 14px;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 14px;
+    }
+    .primary { background: #2563eb; color: #fff; }
+    .secondary { background: #e5e7eb; color: #111; }
+    .danger { background: #ef4444; color: #fff; }
+    .toggle {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 10px;
+      background: #f1f5f9;
+      border-radius: 999px;
+      font-size: 13px;
+      cursor: pointer;
+    }
+    iframe {
+      width: 100%;
+      height: 650px;
+      border: 1px solid #e5e7eb;
+      border-radius: 8px;
+      background: #fff;
+    }
+    pre {
+      background: #0b1020;
+      color: #dbeafe;
+      padding: 12px;
+      border-radius: 8px;
+      overflow: auto;
+      font-size: 12px;
+      max-height: 240px;
+    }
+    .hint { color: #555; font-size: 12px; margin-top: 6px; }
+    .links a { color: #2563eb; text-decoration: none; }
+    .links a:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Nounspace Proxy Toggle Test</h1>
+    <p class="hint">Use this page to simulate the iframe toggle flow Nounspace will use. It calls <code>/session</code> and swaps the iframe between direct and proxied URLs.</p>
+
+    <div class="card">
+      <div class="grid">
+        <div>
+          <label for="targetUrl">Target URL</label>
+          <input id="targetUrl" type="text" value="https://app.katana.network" />
+          <div class="hint">Try: https://app.katana.network, https://github.com</div>
+        </div>
+        <div>
+          <label for="baseUrl">Proxy Base URL</label>
+          <input id="baseUrl" type="text" />
+          <div class="hint">Defaults to current origin. Use your proxy domain when testing from Nounspace.</div>
+        </div>
+      </div>
+
+      <div class="row" style="margin-top: 12px;">
+        <label class="toggle">
+          <input id="proxyToggle" type="checkbox" />
+          Load via proxy
+        </label>
+        <button class="primary" id="enableBtn">Enable Proxy</button>
+        <button class="secondary" id="directBtn">Load Direct</button>
+        <button class="secondary" id="createSessionBtn">Create Session (no iframe)</button>
+      </div>
+
+      <div class="links" style="margin-top: 10px;">
+        <span id="sessionLinks"></span>
+      </div>
+    </div>
+
+    <div class="card">
+      <label>Session Response</label>
+      <pre id="sessionOutput">No session created yet.</pre>
+    </div>
+
+    <div class="card">
+      <label>Iframe Preview</label>
+      <iframe id="previewFrame" sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox allow-modals"></iframe>
+    </div>
+  </div>
+
+  <script src="/nounspace-proxy.js"></script>
+  <script>
+    const targetInput = document.getElementById('targetUrl');
+    const baseInput = document.getElementById('baseUrl');
+    const toggle = document.getElementById('proxyToggle');
+    const enableBtn = document.getElementById('enableBtn');
+    const directBtn = document.getElementById('directBtn');
+    const createSessionBtn = document.getElementById('createSessionBtn');
+    const output = document.getElementById('sessionOutput');
+    const links = document.getElementById('sessionLinks');
+    const iframe = document.getElementById('previewFrame');
+
+    baseInput.value = window.location.origin;
+
+    function client() {
+      return NounspaceProxy.create({ baseUrl: baseInput.value });
+    }
+
+    function renderSession(session) {
+      if (!session) {
+        output.textContent = 'No session created yet.';
+        links.innerHTML = '';
+        return;
+      }
+      output.textContent = JSON.stringify(session, null, 2);
+      const root = session.rootUrl || '';
+      const sessionUrl = session.sessionUrl || session.proxyUrl || '';
+      links.innerHTML = [
+        root ? `<a href="${root}" target="_blank" rel="noreferrer">Open session root</a>` : '',
+        sessionUrl ? ` | <a href="${sessionUrl}" target="_blank" rel="noreferrer">Open session URL</a>` : ''
+      ].join('');
+    }
+
+    async function createSession() {
+      const url = targetInput.value.trim();
+      if (!url) return alert('Please enter a URL');
+      output.textContent = 'Creating session...';
+      try {
+        const session = await client().createSession(url);
+        renderSession(session);
+        return session;
+      } catch (err) {
+        output.textContent = String(err);
+        throw err;
+      }
+    }
+
+    async function enableProxy() {
+      const url = targetInput.value.trim();
+      if (!url) return alert('Please enter a URL');
+      output.textContent = 'Creating session and loading proxied iframe...';
+      try {
+        const session = await client().enableProxy(iframe, url);
+        toggle.checked = true;
+        renderSession(session);
+      } catch (err) {
+        output.textContent = String(err);
+      }
+    }
+
+    function loadDirect() {
+      const url = targetInput.value.trim();
+      if (!url) return alert('Please enter a URL');
+      iframe.src = url;
+      toggle.checked = false;
+    }
+
+    toggle.addEventListener('change', async () => {
+      if (toggle.checked) {
+        await enableProxy();
+      } else {
+        loadDirect();
+      }
+    });
+
+    enableBtn.addEventListener('click', enableProxy);
+    directBtn.addEventListener('click', loadDirect);
+    createSessionBtn.addEventListener('click', createSession);
+
+    // Initial load: direct
+    loadDirect();
+  </script>
+</body>
+</html>
