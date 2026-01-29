@@ -50,6 +50,9 @@ let lastGlobalOrigin = null; // Fallback for requests without session
 const PROXY_CTX_SID_COOKIE = '__proxy_sid';
 const PROXY_CTX_ORIGIN_COOKIE = '__proxy_origin';
 
+// Base domain for per-session subdomains (e.g., "lvh.me" or "proxy.yourdomain.com")
+const PROXY_BASE_DOMAIN = process.env.PROXY_BASE_DOMAIN || '';
+
 // Middleware
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
@@ -77,6 +80,9 @@ app.use((req, res, next) => {
 function getSessionId(req) {
   let sessionId = req.headers['x-proxy-session'];
   if (!sessionId) {
+    sessionId = getSessionIdFromHost(req);
+  }
+  if (!sessionId) {
     sessionId = `session_${Date.now()}_${Math.random().toString(36).slice(2)}`;
   }
   return sessionId;
@@ -89,6 +95,38 @@ function getProxyBase(req) {
   const protocol = req.headers['x-forwarded-proto'] || req.protocol || 'http';
   const host = req.headers['x-forwarded-host'] || req.headers.host;
   return `${protocol}://${host}`;
+}
+
+function getHostParts(req) {
+  const hostHeader = (req.headers['x-forwarded-host'] || req.headers.host || '').toString();
+  if (!hostHeader) return { hostname: '', port: '' };
+  const [hostname, port] = hostHeader.split(':');
+  return { hostname: hostname.toLowerCase(), port: port || '' };
+}
+
+function getSessionIdFromHost(req) {
+  if (!PROXY_BASE_DOMAIN) return null;
+  const { hostname } = getHostParts(req);
+  const base = PROXY_BASE_DOMAIN.toLowerCase();
+  if (!hostname || hostname === base) return null;
+  if (!hostname.endsWith('.' + base)) return null;
+  const prefix = hostname.slice(0, -(base.length + 1));
+  if (!prefix) return null;
+  // Use full prefix as session id (supports dashed or dotted prefixes)
+  return prefix;
+}
+
+function isSessionHost(req, sessionId) {
+  if (!PROXY_BASE_DOMAIN || !sessionId) return false;
+  const { hostname } = getHostParts(req);
+  const expected = `${sessionId}.${PROXY_BASE_DOMAIN}`.toLowerCase();
+  return hostname === expected;
+}
+
+function buildSessionHost(req, sessionId) {
+  const { port } = getHostParts(req);
+  const host = `${sessionId}.${PROXY_BASE_DOMAIN}`;
+  return port ? `${host}:${port}` : host;
 }
 
 function safeDecode(value) {
@@ -1328,12 +1366,25 @@ async function handleProxy(req, res) {
     return res.status(400).json({ error: 'Invalid URL after unwrapping', details: e.message, url: decodedUrl });
   }
   
-  let sessionId = req.query.sid || getSessionId(req);
+  const hostSessionId = getSessionIdFromHost(req);
+  let sessionId = hostSessionId || req.query.sid || getSessionId(req);
   let extraPath = '';
   if (typeof sessionId === 'string' && sessionId.includes('/')) {
     const idx = sessionId.indexOf('/');
     extraPath = sessionId.slice(idx);
     sessionId = sessionId.slice(0, idx) || getSessionId(req);
+  }
+  
+  // Redirect to per-session subdomain if configured and not already on it
+  if (PROXY_BASE_DOMAIN && !isSessionHost(req, sessionId)) {
+    try {
+      const protocol = req.headers['x-forwarded-proto'] || req.protocol || 'http';
+      const sessionHost = buildSessionHost(req, sessionId);
+      const redirectUrl = `${protocol}://${sessionHost}${req.originalUrl}`;
+      return res.redirect(302, redirectUrl);
+    } catch (e) {
+      // Fall through if we can't build the redirect
+    }
   }
   
   if (extraPath) {
@@ -1570,7 +1621,7 @@ app.use(async (req, res, next) => {
   }
   
   // Try to get the origin from session or fallback
-  let sessionId = req.query.sid || req.headers['x-proxy-session'];
+  let sessionId = getSessionIdFromHost(req) || req.query.sid || req.headers['x-proxy-session'];
   const ctxCookies = getProxyContextFromCookies(req);
   if (!sessionId && ctxCookies.sid) {
     sessionId = ctxCookies.sid;
