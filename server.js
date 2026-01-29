@@ -88,6 +88,41 @@ function getProxyBase(req) {
 }
 
 /**
+ * Unwrap a proxied URL back to its original target (handles nested proxy URLs)
+ */
+function unwrapProxyUrl(possibleUrl, proxyBase) {
+  if (!possibleUrl) return possibleUrl;
+  let current = possibleUrl;
+  let guard = 0;
+  let proxyOrigin;
+  try {
+    proxyOrigin = new URL(proxyBase).origin;
+  } catch (e) {
+    return possibleUrl;
+  }
+  while (guard < 3) {
+    guard++;
+    try {
+      const u = new URL(current);
+      if (u.origin !== proxyOrigin || !u.pathname.endsWith('/proxy')) break;
+      const raw = u.searchParams.get('url');
+      if (!raw) break;
+      let next = raw;
+      try {
+        next = decodeURIComponent(raw);
+      } catch (e) {
+        // Keep raw if decode fails
+      }
+      current = next;
+      continue;
+    } catch (e) {
+      break;
+    }
+  }
+  return current;
+}
+
+/**
  * CDN domains that should load directly (no proxy needed - they allow cross-origin)
  */
 const CDN_PASSTHROUGH_DOMAINS = [
@@ -99,6 +134,7 @@ const CDN_PASSTHROUGH_DOMAINS = [
   'arweave.net',
   'fonts.googleapis.com',
   'fonts.gstatic.com',
+  'cdn-global.configcat.com',
   'cdnjs.cloudflare.com',
   'unpkg.com',
   'cdn.jsdelivr.net',
@@ -157,6 +193,11 @@ function shouldBypassProxy(url) {
  */
 function toProxyUrl(targetUrl, proxyBase, sessionId) {
   if (!targetUrl) return targetUrl;
+  
+  // Avoid double-proxying
+  if (targetUrl.includes('/proxy?') && targetUrl.includes('url=')) {
+    return targetUrl;
+  }
   
   // Handle protocol-relative URLs
   if (targetUrl.startsWith('//')) {
@@ -224,6 +265,7 @@ function resolveUrl(relativeUrl, baseUrl) {
 function rewriteHtml(html, targetUrl, proxyBase, sessionId) {
   const $ = cheerio.load(html, { decodeEntities: false });
   const baseUrl = targetUrl;
+  const targetOrigin = new URL(targetUrl).origin;
   
   // Get base tag if present
   const baseTag = $('base').attr('href');
@@ -232,9 +274,41 @@ function rewriteHtml(html, targetUrl, proxyBase, sessionId) {
   // Remove existing base tag (we'll handle URLs ourselves)
   $('base').remove();
   
+  // Rewrite anchor links separately to preserve SPA routing for same-origin
+  $('a[href], area[href]').each((i, el) => {
+    const value = $(el).attr('href');
+    if (!value) return;
+    const trimmed = value.trim();
+    if (!trimmed || 
+        trimmed.startsWith('#') || 
+        trimmed.startsWith('javascript:') ||
+        trimmed.startsWith('mailto:') ||
+        trimmed.startsWith('tel:')) {
+      return;
+    }
+    
+    // Already proxied
+    if (trimmed.includes('/proxy?') && trimmed.includes('url=')) return;
+    
+    const resolvedUrl = resolveUrl(trimmed, effectiveBase);
+    try {
+      const resolved = new URL(resolvedUrl);
+      if (resolved.origin === targetOrigin) {
+        const relative = `${resolved.pathname}${resolved.search}${resolved.hash}`;
+        $(el).attr('href', relative || '/');
+        return;
+      }
+    } catch (e) {
+      // Fall through to proxying
+    }
+    
+    const proxiedUrl = toProxyUrl(resolvedUrl, proxyBase, sessionId);
+    $(el).attr('href', proxiedUrl);
+  });
+  
   // Attributes that contain URLs (expanded for lazy-loading support)
   const urlAttributes = [
-    { selector: '[href]', attr: 'href' },
+    { selector: '[href]:not(a):not(area)', attr: 'href' },
     { selector: '[src]', attr: 'src' },
     { selector: '[action]', attr: 'action' },
     { selector: '[data-src]', attr: 'data-src' },
@@ -389,42 +463,15 @@ function rewriteCssUrls(css, baseUrl, proxyBase, sessionId) {
 function rewriteJavaScript(js, baseUrl, proxyBase, sessionId) {
   const targetOrigin = new URL(baseUrl).origin;
   
-  // Known API domains that need to be proxied (add more as needed)
-  const API_DOMAINS_TO_PROXY = [
-    'api.katana.network',
-    'api.venice.ai',
-    'inference.venice.ai',
-    'api.coingecko.com',
-    'api.coinmarketcap.com',
-    'api.opensea.io',
-    'api.reservoir.tools',
-    'api.zapper.fi',
-    'api.zerion.io',
-  ];
-  
-  // RPC domains to exclude from proxying
-  const RPC_DOMAINS = [
-    'infura.io',
-    'alchemy.com', 
-    'quicknode.com',
-    'ankr.com',
-    'rpc.flashbots.net',
-  ];
-  
-  function shouldProxyDomain(url) {
-    for (const rpc of RPC_DOMAINS) {
-      if (url.includes(rpc)) return false;
-    }
-    return true;
-  }
-  
   // Inject a wrapper at the beginning that provides proxied fetch
   // This wrapper also captures fetch before any other code can
   const wrapper = `
 ;(function(){
-  if(window.__proxyFetchInstalled)return;
-  window.__proxyFetchInstalled=true;
-  var _origFetch=window.fetch&&window.fetch.bind(window);
+  var g = (typeof window !== 'undefined' ? window : (typeof self !== 'undefined' ? self : globalThis));
+  if(!g || !g.fetch) return;
+  if(g.__proxyFetchInstalled)return;
+  g.__proxyFetchInstalled=true;
+  var _origFetch=g.fetch.bind(g);
   var PROXY_BASE=${JSON.stringify(proxyBase)};
   var SID=${JSON.stringify(sessionId)};
   var TARGET_ORIGIN=${JSON.stringify(targetOrigin)};
@@ -439,14 +486,18 @@ function rewriteJavaScript(js, baseUrl, proxyBase, sessionId) {
   
   function proxyUrl(u){
     if(!u||typeof u!=='string')return u;
-    if(u.indexOf('/proxy?url=')!==-1)return u;
+    if((u.indexOf(PROXY_BASE+'/proxy?')===0||u.indexOf('/proxy?')===0)&&u.indexOf('url=')!==-1)return u;
     if(u.indexOf('data:')===0||u.indexOf('blob:')===0)return u;
     if(isRpcDomain(u))return u;
     var full=u;
     if(u.indexOf('//')===0)full='https:'+u;
     else if(u.indexOf('http')!==0){
-      if(u.indexOf('/')===0)full=TARGET_ORIGIN+u;
-      else return u;
+      try{
+        var base=(g.location&&g.location.href)?g.location.href:(TARGET_ORIGIN+'/');
+        full=new URL(u,base).href;
+      }catch(e){
+        return u;
+      }
     }
     return PROXY_BASE+'/proxy?url='+encodeURIComponent(full)+'&sid='+SID;
   }
@@ -454,21 +505,22 @@ function rewriteJavaScript(js, baseUrl, proxyBase, sessionId) {
   // Create a proxy fetch function
   function proxyFetch(input,init){
     var url=typeof input==='string'?input:(input&&input.url?input.url:String(input));
-    var needsProxy=url&&(url.indexOf('http')===0||url.indexOf('//')===0)&&url.indexOf('/proxy?url=')===-1&&!isRpcDomain(url);
-    if(needsProxy){
-      var proxied=proxyUrl(url);
+    var proxied=proxyUrl(url);
+    if(proxied&&proxied!==url){
       if(typeof input==='string')input=proxied;
       else if(input&&input.url)input=new Request(proxied,input);
     }
+    init=init||{};
+    if(!init.credentials) init.credentials='include';
     return _origFetch(input,init);
   }
   
   // Override fetch
-  window.fetch=proxyFetch;
+  g.fetch=proxyFetch;
   
   // Also try to make it non-configurable to prevent overwriting
   try{
-    Object.defineProperty(window,'fetch',{
+    Object.defineProperty(g,'fetch',{
       value:proxyFetch,
       writable:false,
       configurable:false
@@ -476,63 +528,11 @@ function rewriteJavaScript(js, baseUrl, proxyBase, sessionId) {
   }catch(e){}
   
   // Export for modules that might capture it
-  window.__proxyFetch=proxyFetch;
+  g.__proxyFetch=proxyFetch;
 })();
 `;
 
-  let rewritten = js;
-  
-  // STRATEGY 1: Rewrite API URL strings directly
-  // This ensures even concatenated URLs get proxied
-  for (const apiDomain of API_DOMAINS_TO_PROXY) {
-    // Replace "https://api.domain.com with proxied version
-    // Be careful to only replace full URLs, not partial matches
-    const patterns = [
-      // "https://api.domain.com" or 'https://api.domain.com'
-      new RegExp(`(["'\`])(https?:\\/\\/${apiDomain.replace(/\./g, '\\.')})(\\/[^"'\`]*)?\\1`, 'gi'),
-    ];
-    
-    for (const pattern of patterns) {
-      rewritten = rewritten.replace(pattern, (match, quote, baseUrl, path = '') => {
-        const fullUrl = baseUrl + path;
-        const proxiedUrl = toProxyUrl(fullUrl, proxyBase, sessionId);
-        return `${quote}${proxiedUrl}${quote}`;
-      });
-    }
-  }
-  
-  // STRATEGY 2: Replace fetch( calls with fully-qualified URLs
-  // Pattern: fetch("https://... or fetch('https://...
-  rewritten = rewritten.replace(
-    /fetch\s*\(\s*(["'])(https?:\/\/[^"']+)\1/gi,
-    (match, quote, url) => {
-      if (!shouldProxyDomain(url)) return match;
-      const proxiedUrl = toProxyUrl(url, proxyBase, sessionId);
-      return `fetch(${quote}${proxiedUrl}${quote}`;
-    }
-  );
-  
-  // STRATEGY 3: Catch template literal patterns: fetch(\`https://...
-  rewritten = rewritten.replace(
-    /fetch\s*\(\s*`(https?:\/\/[^`\$]+)`/gi,
-    (match, url) => {
-      if (!shouldProxyDomain(url)) return match;
-      const proxiedUrl = toProxyUrl(url, proxyBase, sessionId);
-      return `fetch(\`${proxiedUrl}\``;
-    }
-  );
-  
-  // STRATEGY 4: Replace new Request("https://...")
-  rewritten = rewritten.replace(
-    /new\s+Request\s*\(\s*(["'])(https?:\/\/[^"']+)\1/gi,
-    (match, quote, url) => {
-      if (!shouldProxyDomain(url)) return match;
-      const proxiedUrl = toProxyUrl(url, proxyBase, sessionId);
-      return `new Request(${quote}${proxiedUrl}${quote}`;
-    }
-  );
-
-  return wrapper + rewritten;
+  return wrapper + js;
 }
 
 /**
@@ -643,6 +643,7 @@ function generateInjectedScript(targetUrl, proxyBase, sessionId) {
   const CDN_PASSTHROUGH = [
     'cdn.shopify.com', 'cdn.shopifycdn.net', 'images.unsplash.com',
     'fonts.googleapis.com', 'fonts.gstatic.com', 'cdnjs.cloudflare.com',
+    'cdn-global.configcat.com',
     'unpkg.com', 'cdn.jsdelivr.net', 'ajax.googleapis.com',
     'googletagmanager.com', 'google-analytics.com', 'facebook.net',
     '.amazonaws.com', 'storage.googleapis.com', '.cloudfront.net',
@@ -673,16 +674,20 @@ function generateInjectedScript(targetUrl, proxyBase, sessionId) {
     if (typeof url !== 'string') url = String(url);
     
     // Skip already-proxied URLs
-    if (url.includes('/proxy?url=')) return url;
+    if ((url.startsWith(PROXY_BASE + '/proxy?') || url.startsWith('/proxy?')) && url.includes('url=')) return url;
     
     // Handle relative URLs
     if (!url.startsWith('http://') && !url.startsWith('https://') && !url.startsWith('//')) {
-      if (url.startsWith('/')) {
-        url = TARGET_ORIGIN + url;
-      } else if (!url.startsWith('data:') && !url.startsWith('javascript:') && !url.startsWith('mailto:') && !url.startsWith('tel:') && !url.startsWith('blob:') && !url.startsWith('#')) {
-        const base = TARGET_URL.replace(/\\/[^\\/]*$/, '/');
-        url = base + url;
-      } else {
+      if (url.startsWith('data:') || url.startsWith('javascript:') || url.startsWith('mailto:') || url.startsWith('tel:') || url.startsWith('blob:') || url.startsWith('#')) {
+        return url;
+      }
+      try {
+        if (url.startsWith('/')) {
+          url = TARGET_ORIGIN + url;
+        } else {
+          url = new URL(url, virtualUrl).href;
+        }
+      } catch(e) {
         return url;
       }
     }
@@ -701,12 +706,11 @@ function generateInjectedScript(targetUrl, proxyBase, sessionId) {
   // Convert proxied URL back to original URL
   function fromProxyUrl(proxyUrl) {
     if (!proxyUrl || typeof proxyUrl !== 'string') return proxyUrl;
-    const match = proxyUrl.match(/\\/proxy\\?url=([^&]+)/);
-    if (match) {
-      try {
-        return decodeURIComponent(match[1]);
-      } catch(e) {}
-    }
+    try {
+      const u = new URL(proxyUrl, PROXY_BASE);
+      const raw = u.searchParams.get('url');
+      if (raw) return decodeURIComponent(raw);
+    } catch(e) {}
     return proxyUrl;
   }
   
@@ -715,6 +719,10 @@ function generateInjectedScript(targetUrl, proxyBase, sessionId) {
   
   // Track the "virtual" URL the app thinks it's at
   let virtualUrl = TARGET_URL;
+  if (typeof virtualUrl === 'string' && virtualUrl.includes('/proxy?') && virtualUrl.includes('url=')) {
+    const extracted = fromProxyUrl(virtualUrl);
+    if (extracted) virtualUrl = extracted;
+  }
   window.__proxyVirtualUrl = virtualUrl; // Expose for debugging
   
   // Store original history methods IMMEDIATELY
@@ -727,7 +735,7 @@ function generateInjectedScript(targetUrl, proxyBase, sessionId) {
     if (typeof url !== 'string') url = String(url);
     
     // Already a proxy path
-    if (url.includes('/proxy?url=')) {
+    if (url.includes('/proxy?') && url.includes('url=')) {
       return url.startsWith('http') ? new URL(url).pathname + new URL(url).search : url;
     }
     
@@ -763,7 +771,12 @@ function generateInjectedScript(targetUrl, proxyBase, sessionId) {
     if (url) {
       try {
         // Update virtual URL tracking
-        const resolvedUrl = new URL(url, virtualUrl).href;
+        let resolvedUrl;
+        if (typeof url === 'string' && url.includes('/proxy?') && url.includes('url=')) {
+          resolvedUrl = fromProxyUrl(url) || new URL(url, virtualUrl).href;
+        } else {
+          resolvedUrl = new URL(url, virtualUrl).href;
+        }
         virtualUrl = resolvedUrl;
         window.__proxyVirtualUrl = virtualUrl;
         
@@ -786,7 +799,12 @@ function generateInjectedScript(targetUrl, proxyBase, sessionId) {
     console.log('[IframeProxy] replaceState called with:', url);
     if (url) {
       try {
-        const resolvedUrl = new URL(url, virtualUrl).href;
+        let resolvedUrl;
+        if (typeof url === 'string' && url.includes('/proxy?') && url.includes('url=')) {
+          resolvedUrl = fromProxyUrl(url) || new URL(url, virtualUrl).href;
+        } else {
+          resolvedUrl = new URL(url, virtualUrl).href;
+        }
         virtualUrl = resolvedUrl;
         window.__proxyVirtualUrl = virtualUrl;
         
@@ -933,16 +951,9 @@ function generateInjectedScript(targetUrl, proxyBase, sessionId) {
       return _origFetch(input, init);
     }
     
-    // Check if this needs proxying
-    const needsProxy = originalUrl && (
-      originalUrl.startsWith('http://') || 
-      originalUrl.startsWith('https://') || 
-      originalUrl.startsWith('//')
-    ) && !originalUrl.includes('/proxy?url=') && !originalUrl.startsWith(PROXY_BASE) && !shouldBypassProxy(originalUrl);
-    
+    const proxiedUrl = toProxyUrl(originalUrl);
     let url = input;
-    if (needsProxy) {
-      const proxiedUrl = toProxyUrl(originalUrl);
+    if (proxiedUrl && proxiedUrl !== originalUrl) {
       if (typeof input === 'string') {
         url = proxiedUrl;
       } else if (input instanceof Request) {
@@ -963,6 +974,7 @@ function generateInjectedScript(targetUrl, proxyBase, sessionId) {
   window.fetch = proxyFetch;
   window.__origFetch = _origFetch;
   window.__proxyFetch = proxyFetch;
+  window.__proxyFetchInstalled = true;
   
   // ===== XHR INTERCEPTION =====
   
@@ -1015,7 +1027,7 @@ function generateInjectedScript(targetUrl, proxyBase, sessionId) {
     const form = e.target;
     if (form && form.tagName === 'FORM') {
       const action = form.getAttribute('action') || '';
-      if (!action.includes('/proxy?url=')) {
+      if (!(action.includes('/proxy?') && action.includes('url='))) {
         form.action = toProxyUrl(action || virtualUrl);
       }
     }
@@ -1041,7 +1053,7 @@ function generateInjectedScript(targetUrl, proxyBase, sessionId) {
       }
       
       // Skip special URLs
-      if (href.startsWith('javascript:') || href.startsWith('#') || href.includes('/proxy?url=')) {
+      if (href.startsWith('javascript:') || href.startsWith('#') || (href.includes('/proxy?') && href.includes('url='))) {
         return;
       }
       
@@ -1097,13 +1109,13 @@ function generateInjectedScript(targetUrl, proxyBase, sessionId) {
   function rewriteElement(el) {
     for (const attr of lazyAttrs) {
       const val = el.getAttribute(attr);
-      if (val && !val.includes('/proxy?url=') && !val.startsWith('data:')) {
+      if (val && !(val.includes('/proxy?') && val.includes('url=')) && !val.startsWith('data:')) {
         el.setAttribute(attr, toProxyUrl(val));
       }
     }
     // Handle srcset
     const srcset = el.getAttribute('srcset') || el.getAttribute('data-srcset');
-    if (srcset && !srcset.includes('/proxy?url=')) {
+    if (srcset && !(srcset.includes('/proxy?') && srcset.includes('url='))) {
       const rewritten = srcset.split(',').map(part => {
         const [url, ...rest] = part.trim().split(/\\s+/);
         return [toProxyUrl(url), ...rest].join(' ');
@@ -1225,14 +1237,59 @@ async function handleProxy(req, res) {
     return res.status(400).json({ error: 'Invalid URL', details: e.message });
   }
   
-  const sessionId = req.query.sid || getSessionId(req);
   const proxyBase = getProxyBase(req);
+  // If the URL points back to this proxy, unwrap it to the real target
+  decodedUrl = unwrapProxyUrl(decodedUrl, proxyBase);
+  try {
+    new URL(decodedUrl);
+  } catch (e) {
+    return res.status(400).json({ error: 'Invalid URL after unwrapping', details: e.message, url: decodedUrl });
+  }
+  
+  let sessionId = req.query.sid || getSessionId(req);
+  let extraPath = '';
+  if (typeof sessionId === 'string' && sessionId.includes('/')) {
+    const idx = sessionId.indexOf('/');
+    extraPath = sessionId.slice(idx);
+    sessionId = sessionId.slice(0, idx) || getSessionId(req);
+  }
+  
+  if (extraPath) {
+    try {
+      const base = new URL(decodedUrl);
+      const extra = new URL(extraPath, base.origin);
+      base.pathname = base.pathname.replace(/\/$/, '') + extra.pathname;
+      if (extra.search) base.search = extra.search;
+      if (extra.hash) base.hash = extra.hash;
+      decodedUrl = base.href;
+    } catch (e) {
+      decodedUrl = decodedUrl + extraPath;
+    }
+  }
   
   // Track the origin for this session (for catch-all routing of dynamic imports)
   try {
-    const targetOrigin = new URL(decodedUrl).origin;
-    sessionOrigins.set(sessionId, targetOrigin);
-    lastGlobalOrigin = targetOrigin;
+    const proxyOrigin = new URL(proxyBase).origin;
+    let targetOrigin = new URL(decodedUrl).origin;
+    
+    // If we somehow still have the proxy origin, try to recover from Referer
+    if (targetOrigin === proxyOrigin) {
+      const ref = req.headers['referer'] || req.headers['referrer'];
+      if (ref) {
+        const unwrappedRef = unwrapProxyUrl(ref, proxyBase);
+        try {
+          targetOrigin = new URL(unwrappedRef).origin;
+        } catch (e) {}
+      }
+    }
+    
+    // Only store non-proxy origins to avoid poisoning
+    if (targetOrigin && targetOrigin !== proxyOrigin) {
+      sessionOrigins.set(sessionId, targetOrigin);
+      lastGlobalOrigin = targetOrigin;
+    } else {
+      console.warn('[IframeProxy] Skipping proxy origin for session tracking:', targetOrigin);
+    }
   } catch (e) {}
   
   try {
@@ -1370,9 +1427,13 @@ async function handleProxy(req, res) {
     
   } catch (error) {
     console.error('[IframeProxy] Error fetching:', decodedUrl, error.message);
+    if (error && error.stack) console.error(error.stack);
     res.status(500).json({ 
       error: 'Proxy error', 
-      details: error.message,
+      details: error.message || String(error),
+      code: error.code,
+      errno: error.errno,
+      type: error.type,
       url: decodedUrl 
     });
   }
@@ -1411,10 +1472,19 @@ app.use(async (req, res, next) => {
   // Try to get the origin from session or fallback
   const sessionId = req.query.sid || req.headers['x-proxy-session'];
   let targetOrigin = sessionId ? sessionOrigins.get(sessionId) : null;
+  let proxyOrigin = null;
+  try {
+    proxyOrigin = new URL(getProxyBase(req)).origin;
+  } catch (e) {}
   
   // Fallback to last global origin (works for single-site testing)
   if (!targetOrigin) {
     targetOrigin = lastGlobalOrigin;
+  }
+  
+  // Avoid proxy-origin poisoning
+  if (proxyOrigin && targetOrigin === proxyOrigin) {
+    targetOrigin = lastGlobalOrigin && lastGlobalOrigin !== proxyOrigin ? lastGlobalOrigin : null;
   }
   
   if (!targetOrigin) {
@@ -1483,10 +1553,14 @@ app.use(async (req, res, next) => {
     
   } catch (error) {
     console.error('[IframeProxy] Catch-all error:', targetUrl, error.message);
+    if (error && error.stack) console.error(error.stack);
     res.status(500).json({ 
       success: false,
       error: 'Proxy error', 
-      details: error.message,
+      details: error.message || String(error),
+      code: error.code,
+      errno: error.errno,
+      type: error.type,
       path: path,
       targetUrl: targetUrl
     });
