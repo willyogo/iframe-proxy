@@ -49,6 +49,27 @@ POST /proxy?url=<encoded-url>  (for form submissions)
 curl "http://localhost:3001/proxy?url=https://github.com"
 ```
 
+#### Create a Session (Widget-style toggle)
+```
+POST /session
+```
+
+**Body:**
+```json
+{ "url": "https://app.katana.network" }
+```
+
+**Response:**
+```json
+{
+  "sessionId": "session_...",
+  "sessionUrl": "https://<session>.<yourdomain>/proxy?url=https%3A%2F%2Fapp.katana.network",
+  "proxyUrl": "https://<session>.<yourdomain>/proxy?url=...",
+  "targetUrl": "https://app.katana.network",
+  "targetOrigin": "https://app.katana.network"
+}
+```
+
 #### Health Check
 ```
 GET /health
@@ -62,19 +83,26 @@ Visit `http://localhost:3001/test.html` to see a side-by-side comparison of dire
 
 ## Integration with nounspace.com
 
-To use this proxy for "load via proxy" functionality:
+To use this proxy for "load via proxy" functionality with a toggle:
+
+```html
+<script src="https://your-proxy-domain.com/nounspace-proxy.js"></script>
+```
 
 ```javascript
-// When normal iframe embed fails
-function loadViaProxy(url, iframeElement) {
-  const proxyUrl = `https://your-proxy-domain.com/proxy?url=${encodeURIComponent(url)}`;
-  iframeElement.src = proxyUrl;
-}
+const proxyClient = NounspaceProxy.create({
+  baseUrl: 'https://your-proxy-domain.com'
+});
 
-// Example usage
 const iframe = document.getElementById('myIframe');
-iframe.onerror = () => loadViaProxy(originalUrl, iframe);
-// or detect X-Frame-Options failure via other means
+
+async function setProxyEnabled(enabled, targetUrl) {
+  if (enabled) {
+    await proxyClient.enableProxy(iframe, targetUrl);
+  } else {
+    proxyClient.disableProxy(iframe, targetUrl);
+  }
+}
 ```
 
 ### Detecting iframe load failures
@@ -130,6 +158,7 @@ setTimeout(() => {
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `PORT`   | 3001    | Server port |
+| `PROXY_BASE_DOMAIN` | (empty) | Base domain for per-session subdomains (e.g. `lvh.me` for local dev) |
 
 ## Development
 

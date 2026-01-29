@@ -53,6 +53,9 @@ const PROXY_CTX_ORIGIN_COOKIE = '__proxy_origin';
 // Base domain for per-session subdomains (e.g., "lvh.me" or "proxy.yourdomain.com")
 const PROXY_BASE_DOMAIN = process.env.PROXY_BASE_DOMAIN || '';
 
+// Track starting URL per session (used by SDK/session creation)
+const sessionStartUrls = new Map();
+
 // Middleware
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
@@ -77,13 +80,20 @@ app.use((req, res, next) => {
 /**
  * Get or create a session ID for cookie isolation
  */
+function normalizeSessionId(value) {
+  if (!value) return null;
+  const cleaned = String(value).toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-');
+  return cleaned.replace(/^-+|-+$/g, '') || null;
+}
+
 function getSessionId(req) {
   let sessionId = req.headers['x-proxy-session'];
   if (!sessionId) {
     sessionId = getSessionIdFromHost(req);
   }
+  sessionId = normalizeSessionId(sessionId);
   if (!sessionId) {
-    sessionId = `session_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    sessionId = `session-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
   }
   return sessionId;
 }
@@ -112,8 +122,8 @@ function getSessionIdFromHost(req) {
   if (!hostname.endsWith('.' + base)) return null;
   const prefix = hostname.slice(0, -(base.length + 1));
   if (!prefix) return null;
-  // Use full prefix as session id (supports dashed or dotted prefixes)
-  return prefix;
+  // Use full prefix as session id
+  return normalizeSessionId(prefix) || prefix;
 }
 
 function isSessionHost(req, sessionId) {
@@ -1368,6 +1378,7 @@ async function handleProxy(req, res) {
   
   const hostSessionId = getSessionIdFromHost(req);
   let sessionId = hostSessionId || req.query.sid || getSessionId(req);
+  sessionId = normalizeSessionId(sessionId) || getSessionId(req);
   let extraPath = '';
   if (typeof sessionId === 'string' && sessionId.includes('/')) {
     const idx = sessionId.indexOf('/');
@@ -1594,6 +1605,56 @@ async function handleProxy(req, res) {
 app.get('/proxy', handleProxy);
 app.post('/proxy', handleProxy);
 
+// Create a new proxy session and return a session URL (for widget-style toggles)
+app.post('/session', (req, res) => {
+  const targetUrl = req.body && req.body.url;
+  if (!targetUrl) {
+    return res.status(400).json({ error: 'Missing url in body' });
+  }
+  
+  let decodedUrl;
+  try {
+    decodedUrl = decodeURIComponent(targetUrl);
+    new URL(decodedUrl);
+  } catch (e) {
+    return res.status(400).json({ error: 'Invalid URL', details: e.message });
+  }
+  
+  const proxyBase = getProxyBase(req);
+  let sessionId = (req.body && req.body.sid) ? String(req.body.sid) : getSessionId(req);
+  sessionId = normalizeSessionId(sessionId) || getSessionId(req);
+  
+  let targetOrigin = null;
+  try {
+    targetOrigin = new URL(decodedUrl).origin;
+  } catch (e) {}
+  
+  if (targetOrigin) {
+    sessionOrigins.set(sessionId, targetOrigin);
+    lastGlobalOrigin = targetOrigin;
+  }
+  sessionStartUrls.set(sessionId, decodedUrl);
+  
+  const protocol = req.headers['x-forwarded-proto'] || req.protocol || 'http';
+  let sessionHost = req.headers['x-forwarded-host'] || req.headers.host;
+  if (PROXY_BASE_DOMAIN) {
+    sessionHost = buildSessionHost(req, sessionId);
+  }
+  
+  let sessionBase = `${protocol}://${sessionHost}`;
+  const proxyUrl = `${sessionBase}/proxy?url=${encodeURIComponent(decodedUrl)}${PROXY_BASE_DOMAIN ? '' : `&sid=${encodeURIComponent(sessionId)}`}`;
+  
+  setProxyContextCookies(res, req, sessionId, targetOrigin);
+  
+  res.json({
+    sessionId,
+    sessionUrl: proxyUrl,
+    proxyUrl,
+    targetUrl: decodedUrl,
+    targetOrigin
+  });
+});
+
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
@@ -1622,6 +1683,7 @@ app.use(async (req, res, next) => {
   
   // Try to get the origin from session or fallback
   let sessionId = getSessionIdFromHost(req) || req.query.sid || req.headers['x-proxy-session'];
+  sessionId = normalizeSessionId(sessionId) || sessionId;
   const ctxCookies = getProxyContextFromCookies(req);
   if (!sessionId && ctxCookies.sid) {
     sessionId = ctxCookies.sid;
