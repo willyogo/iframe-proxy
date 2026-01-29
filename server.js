@@ -514,12 +514,24 @@ function rewriteJavaScript(js, baseUrl, proxyBase, sessionId) {
     if(u.indexOf('//')===0)full='https:'+u;
     else if(u.indexOf('http')!==0){
       try{
-        var base=(g.location&&g.location.href)?g.location.href:(TARGET_ORIGIN+'/');
+        var base=(g.__proxyVirtualUrl|| (g.location&&g.location.href) || (TARGET_ORIGIN+'/'));
         full=new URL(u,base).href;
       }catch(e){
         return u;
       }
     }
+    // If URL points to proxy origin, remap to target origin
+    try{
+      var pbase=new URL(PROXY_BASE);
+      var uo=new URL(full, pbase.origin);
+      if(uo.origin===pbase.origin){
+        var remap=new URL(TARGET_ORIGIN);
+        remap.pathname=uo.pathname;
+        remap.search=uo.search;
+        remap.hash=uo.hash;
+        full=remap.href;
+      }
+    }catch(e){}
     return PROXY_BASE+'/proxy?url='+encodeURIComponent(full)+'&sid='+SID;
   }
   
@@ -696,6 +708,21 @@ function generateInjectedScript(targetUrl, proxyBase, sessionId) {
     
     // Skip already-proxied URLs
     if ((url.startsWith(PROXY_BASE + '/proxy?') || url.startsWith('/proxy?')) && url.includes('url=')) return url;
+    
+    // If URL is absolute and points back to proxy origin, remap to target origin
+    if (url.startsWith(PROXY_BASE) || url.startsWith('http://') || url.startsWith('https://') || url.startsWith('//')) {
+      try {
+        const proxyOrigin = new URL(PROXY_BASE).origin;
+        const parsed = new URL(url, proxyOrigin);
+        if (parsed.origin === proxyOrigin) {
+          const remap = new URL(TARGET_ORIGIN);
+          remap.pathname = parsed.pathname;
+          remap.search = parsed.search;
+          remap.hash = parsed.hash;
+          url = remap.href;
+        }
+      } catch (e) {}
+    }
     
     // Handle relative URLs
     if (!url.startsWith('http://') && !url.startsWith('https://') && !url.startsWith('//')) {
@@ -1506,20 +1533,23 @@ app.use(async (req, res, next) => {
     proxyOrigin = new URL(getProxyBase(req)).origin;
   } catch (e) {}
   
+  // Prefer referer origin when available (more accurate for resources)
+  let refererOrigin = null;
+  const ref = req.headers['referer'] || req.headers['referrer'];
+  if (ref) {
+    try {
+      const unwrappedRef = unwrapProxyUrl(ref, getProxyBase(req));
+      refererOrigin = new URL(unwrappedRef).origin;
+    } catch (e) {}
+  }
+  
+  if (refererOrigin && (!proxyOrigin || refererOrigin !== proxyOrigin)) {
+    targetOrigin = refererOrigin;
+  }
+  
   // Fallback to last global origin (works for single-site testing)
   if (!targetOrigin) {
     targetOrigin = lastGlobalOrigin;
-  }
-  
-  // If still missing, try to recover from Referer
-  if (!targetOrigin) {
-    const ref = req.headers['referer'] || req.headers['referrer'];
-    if (ref) {
-      try {
-        const unwrappedRef = unwrapProxyUrl(ref, getProxyBase(req));
-        targetOrigin = new URL(unwrappedRef).origin;
-      } catch (e) {}
-    }
   }
   
   // Avoid proxy-origin poisoning
@@ -1584,7 +1614,7 @@ app.use(async (req, res, next) => {
     const contentType = response.headers.get('content-type') || '';
     
     // If we got HTML for a resource request, it might be an error page - proxy it properly
-    if (contentType.includes('text/html') && !isDocumentRequest) {
+    if (contentType.includes('text/html') && !isDocRequest) {
       const html = await response.text();
       const proxyBase = getProxyBase(req);
       const rewritten = rewriteHtml(html, targetUrl, proxyBase, sessionId || 'default');
