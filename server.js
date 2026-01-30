@@ -701,6 +701,27 @@ function rewriteJavaScript(js, baseUrl, proxyBase, sessionId) {
   // Create a proxy fetch function
   function proxyFetch(input,init){
     var url=typeof input==='string'?input:(input&&input.url?input.url:String(input));
+    
+    // Fix URLs where a path was appended after proxy parameters (common bug pattern)
+    // e.g., "/proxy?url=https%3A%2F%2Fapi.example.com&sid=xxx/vaults/holdings"
+    // should become a proper request to https://api.example.com/vaults/holdings
+    if(url && typeof url==='string' && url.includes('/proxy?') && url.includes('url=')) {
+      var sidMatch = url.match(/[&?]sid=[^/&]+(\/.+)$/);
+      if(sidMatch && sidMatch[1]) {
+        // Found path appended after sid - extract and fix
+        var appendedPath = sidMatch[1];
+        var baseMatch = url.match(/[?&]url=([^&]+)/);
+        if(baseMatch) {
+          try {
+            var baseUrl = decodeURIComponent(baseMatch[1]);
+            var fixedUrl = baseUrl + appendedPath;
+            console.log('[IframeProxy] Fixed malformed URL:', url, '->', fixedUrl);
+            url = fixedUrl;
+          } catch(e) {}
+        }
+      }
+    }
+    
     var proxied=proxyUrl(url);
     if(proxied&&proxied!==url){
       if(typeof input==='string')input=proxied;
@@ -919,13 +940,51 @@ function generateInjectedScript(targetUrl, proxyBase, sessionId) {
   
   // Convert proxied URL back to original URL
   function fromProxyUrl(proxyUrl) {
-    if (!proxyUrl || typeof proxyUrl !== 'string') return proxyUrl;
+    if (!proxyUrl || typeof proxyUrl !== 'string') return null;
     try {
-      const u = new URL(proxyUrl, PROXY_BASE);
+      // Handle both full URLs and relative paths
+      let urlToParse = proxyUrl;
+      if (proxyUrl.startsWith('/')) {
+        urlToParse = PROXY_BASE + proxyUrl;
+      }
+      
+      // Try to extract the 'url' parameter
+      const u = new URL(urlToParse);
       const raw = u.searchParams.get('url');
-      if (raw) return decodeURIComponent(raw);
-    } catch(e) {}
-    return proxyUrl;
+      if (raw) {
+        // The value might be URL-encoded or not
+        try {
+          // If it looks like it's encoded (contains %3A, %2F etc)
+          if (raw.includes('%')) {
+            return decodeURIComponent(raw);
+          }
+          return raw;
+        } catch(e) {
+          return raw;
+        }
+      }
+      
+      // Also check for url= pattern in case URL parsing got confused
+      const match = proxyUrl.match(/[?&]url=([^&]+)/);
+      if (match) {
+        try {
+          return decodeURIComponent(match[1]);
+        } catch(e) {
+          return match[1];
+        }
+      }
+    } catch(e) {
+      // Try regex as fallback
+      const match = proxyUrl.match(/[?&]url=([^&]+)/);
+      if (match) {
+        try {
+          return decodeURIComponent(match[1]);
+        } catch(e) {
+          return match[1];
+        }
+      }
+    }
+    return null;
   }
   
   // ===== SPA HISTORY API INTERCEPTION =====
@@ -990,19 +1049,44 @@ function generateInjectedScript(targetUrl, proxyBase, sessionId) {
     console.log('[IframeProxy] pushState called with:', url);
     if (url) {
       try {
-        // Update virtual URL tracking
         let resolvedUrl;
-        if (typeof url === 'string' && url.includes('/proxy?') && url.includes('url=')) {
-          resolvedUrl = fromProxyUrl(url) || new URL(url, virtualUrl).href;
+        let cleanUrl = url;
+        
+        // Check if URL contains proxy path pattern and unwrap it
+        if (typeof url === 'string' && (url.includes('/proxy?') || url.includes('/proxy%3F')) && url.includes('url=')) {
+          const unwrapped = fromProxyUrl(url);
+          if (unwrapped) {
+            console.log('[IframeProxy] Unwrapped proxy URL in pushState:', url, '->', unwrapped);
+            resolvedUrl = unwrapped;
+            // For the actual browser URL, use the relative path from unwrapped
+            try {
+              const unwrappedUrl = new URL(unwrapped);
+              cleanUrl = unwrappedUrl.pathname + unwrappedUrl.search + unwrappedUrl.hash;
+            } catch(e) {
+              cleanUrl = unwrapped;
+            }
+          } else {
+            resolvedUrl = new URL(url, virtualUrl).href;
+          }
         } else {
           resolvedUrl = new URL(url, virtualUrl).href;
         }
+        
+        // Extra safety: if resolvedUrl contains proxy pattern, try to unwrap it
+        if (resolvedUrl && resolvedUrl.includes('/proxy?') && resolvedUrl.includes('url=')) {
+          const doubleUnwrap = fromProxyUrl(resolvedUrl);
+          if (doubleUnwrap) {
+            console.log('[IframeProxy] Double-unwrapped:', resolvedUrl, '->', doubleUnwrap);
+            resolvedUrl = doubleUnwrap;
+          }
+        }
+        
         virtualUrl = resolvedUrl;
         window.__proxyVirtualUrl = virtualUrl;
         
         // Convert to proxy path
-        const proxyPath = toProxyPath(url);
-        console.log('[IframeProxy] pushState converted to:', proxyPath);
+        const proxyPath = toProxyPath(cleanUrl);
+        console.log('[IframeProxy] pushState resolved to:', resolvedUrl, 'browser path:', proxyPath);
         
         const enhancedState = Object.assign({}, state || {}, { __virtualUrl: resolvedUrl });
         return _origPushState.call(this, enhancedState, title, proxyPath);
@@ -1020,16 +1104,41 @@ function generateInjectedScript(targetUrl, proxyBase, sessionId) {
     if (url) {
       try {
         let resolvedUrl;
-        if (typeof url === 'string' && url.includes('/proxy?') && url.includes('url=')) {
-          resolvedUrl = fromProxyUrl(url) || new URL(url, virtualUrl).href;
+        let cleanUrl = url;
+        
+        // Check if URL contains proxy path pattern and unwrap it
+        if (typeof url === 'string' && (url.includes('/proxy?') || url.includes('/proxy%3F')) && url.includes('url=')) {
+          const unwrapped = fromProxyUrl(url);
+          if (unwrapped) {
+            console.log('[IframeProxy] Unwrapped proxy URL in replaceState:', url, '->', unwrapped);
+            resolvedUrl = unwrapped;
+            try {
+              const unwrappedUrl = new URL(unwrapped);
+              cleanUrl = unwrappedUrl.pathname + unwrappedUrl.search + unwrappedUrl.hash;
+            } catch(e) {
+              cleanUrl = unwrapped;
+            }
+          } else {
+            resolvedUrl = new URL(url, virtualUrl).href;
+          }
         } else {
           resolvedUrl = new URL(url, virtualUrl).href;
         }
+        
+        // Extra safety: if resolvedUrl contains proxy pattern, unwrap it
+        if (resolvedUrl && resolvedUrl.includes('/proxy?') && resolvedUrl.includes('url=')) {
+          const doubleUnwrap = fromProxyUrl(resolvedUrl);
+          if (doubleUnwrap) {
+            console.log('[IframeProxy] Double-unwrapped:', resolvedUrl, '->', doubleUnwrap);
+            resolvedUrl = doubleUnwrap;
+          }
+        }
+        
         virtualUrl = resolvedUrl;
         window.__proxyVirtualUrl = virtualUrl;
         
-        const proxyPath = toProxyPath(url);
-        console.log('[IframeProxy] replaceState converted to:', proxyPath);
+        const proxyPath = toProxyPath(cleanUrl);
+        console.log('[IframeProxy] replaceState resolved to:', resolvedUrl, 'browser path:', proxyPath);
         
         const enhancedState = Object.assign({}, state || {}, { __virtualUrl: resolvedUrl });
         return _origReplaceState.call(this, enhancedState, title, proxyPath);
