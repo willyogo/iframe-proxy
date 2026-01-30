@@ -1887,6 +1887,16 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
+// Explicitly serve the Nounspace toggle test page to avoid proxy catch-all
+app.get('/nounspace-toggle-test.html', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'nounspace-toggle-test.html'));
+});
+
+// Explicitly serve the SDK
+app.get('/nounspace-proxy.js', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'nounspace-proxy.js'));
+});
+
 app.get('/', (req, res) => {
   const sessionHostId = getSessionIdFromHost(req);
   if (PROXY_BASE_DOMAIN && sessionHostId) {
@@ -1917,7 +1927,7 @@ app.use(async (req, res, next) => {
   const path = req.path;
   
   // Skip if it's a known route or static file exists
-  if (path === '/' || path === '/proxy' || path === '/health' || path.startsWith('/test')) {
+  if (path === '/' || path === '/proxy' || path === '/health' || path.startsWith('/test') || path === '/nounspace-toggle-test.html' || path === '/nounspace-proxy.js') {
     return next();
   }
   
