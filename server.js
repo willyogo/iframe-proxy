@@ -32,12 +32,17 @@ process.on('unhandledRejection', (reason, promise) => {
 
 const express = require('express');
 const cheerio = require('cheerio');
-const fetch = require('node-fetch');
+const { chromium } = require('playwright');
 const { URL } = require('url');
 const cookieModule = require('cookie');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
+
+// Browser pool for Playwright (bypasses Cloudflare & bot detection)
+let browserPool = [];
+const MAX_BROWSERS = parseInt(process.env.MAX_BROWSERS || '3', 10);
+let browserIndex = 0;
 
 // Store cookies per session (keyed by a session ID we generate)
 const cookieJar = new Map();
@@ -61,6 +66,121 @@ const ASSET_CACHE_TTL_MS = parseInt(process.env.ASSET_CACHE_TTL_MS || '600000', 
 const ASSET_CACHE_MAX_BYTES = parseInt(process.env.ASSET_CACHE_MAX_BYTES || String(50 * 1024 * 1024), 10); // 50MB
 const assetCache = new Map(); // url -> { body, contentType, cacheControl, status, ts, size }
 let assetCacheBytes = 0;
+
+/**
+ * Initialize Playwright browser pool
+ */
+async function initBrowserPool() {
+  console.log(`[IframeProxy] Initializing ${MAX_BROWSERS} browser instances...`);
+  for (let i = 0; i < MAX_BROWSERS; i++) {
+    try {
+      const browser = await chromium.launch({
+        headless: true,
+        args: [
+          '--no-sandbox',
+          '--disable-setuid-sandbox',
+          '--disable-dev-shm-usage',
+          '--disable-blink-features=AutomationControlled',
+        ],
+      });
+      browserPool.push(browser);
+      console.log(`[IframeProxy] Browser ${i + 1}/${MAX_BROWSERS} initialized`);
+    } catch (e) {
+      console.error(`[IframeProxy] Failed to init browser ${i + 1}:`, e.message);
+    }
+  }
+  console.log(`[IframeProxy] Browser pool ready (${browserPool.length} instances)`);
+}
+
+/**
+ * Get next browser from pool (round-robin)
+ */
+function getNextBrowser() {
+  if (browserPool.length === 0) return null;
+  const browser = browserPool[browserIndex];
+  browserIndex = (browserIndex + 1) % browserPool.length;
+  return browser;
+}
+
+/**
+ * Fetch using Playwright with real browser (compatible with node-fetch API)
+ */
+async function fetchWithBrowser(url, options = {}) {
+  const browser = getNextBrowser();
+  if (!browser) {
+    throw new Error('No browser available in pool');
+  }
+  
+  const context = await browser.newContext({
+    userAgent: options.headers?.['User-Agent'] || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+    viewport: { width: 1920, height: 1080 },
+    extraHTTPHeaders: options.headers || {},
+  });
+  
+  const page = await context.newPage();
+  
+  try {
+    const response = await page.goto(url, {
+      waitUntil: 'networkidle',
+      timeout: 30000,
+    });
+    
+    if (!response) {
+      throw new Error('No response from page.goto');
+    }
+    
+    const headers = await response.allHeaders();
+    const finalUrl = page.url();
+    const contentType = headers['content-type'] || '';
+    
+    let body;
+    if (contentType.includes('text/html')) {
+      body = await page.content();
+    } else {
+      body = await response.body();
+    }
+    
+    await context.close();
+    
+    // Return node-fetch compatible response object with proper headers interface
+    const headersObj = {
+      get: (key) => headers[key.toLowerCase()],
+      raw: () => ({ 'set-cookie': [] }), // Simplified for now
+      forEach: (callback) => {
+        Object.keys(headers).forEach(key => callback(headers[key], key));
+      },
+    };
+    
+    return {
+      status: response.status(),
+      headers: headersObj,
+      text: async () => Buffer.isBuffer(body) ? body.toString('utf-8') : body,
+      buffer: async () => Buffer.isBuffer(body) ? body : Buffer.from(body),
+      url: finalUrl,
+    };
+  } catch (error) {
+    await context.close();
+    throw error;
+  }
+}
+
+/**
+ * Cleanup on exit
+ */
+async function cleanup() {
+  console.log('[IframeProxy] Shutting down...');
+  for (const browser of browserPool) {
+    try {
+      await browser.close();
+    } catch (e) {
+      console.error('[IframeProxy] Error closing browser:', e.message);
+    }
+  }
+  process.exit(0);
+}
+
+process.on('SIGINT', cleanup);
+process.on('SIGTERM', cleanup);
 
 // Middleware
 app.use(express.urlencoded({ extended: true }));
@@ -1688,34 +1808,13 @@ async function handleProxy(req, res) {
       }
     }
     
-    // Fetch the target URL
-    let response = await fetch(decodedUrl, fetchOptions);
+    // Fetch the target URL using Playwright (bypasses Cloudflare)
+    console.log(`[IframeProxy] Fetching (browser): ${decodedUrl} [session: ${sessionId}]`);
+    let response = await fetchWithBrowser(decodedUrl, fetchOptions);
     
-    // Handle redirects - keep them within the proxy
-    let redirectCount = 0;
-    const maxRedirects = 10;
-    while (response.status >= 300 && response.status < 400 && redirectCount < maxRedirects) {
-      const location = response.headers.get('location');
-      if (!location) break;
-      
-      // Resolve relative redirects
-      const redirectUrl = new URL(location, decodedUrl).href;
-      console.log('[IframeProxy] Following redirect:', decodedUrl, '->', redirectUrl);
-      
-      // Update the decoded URL for subsequent processing
-      decodedUrl = redirectUrl;
-      
-      // Fetch the redirect target
-      response = await fetch(redirectUrl, { 
-        ...fetchOptions, 
-        headers: {
-          ...headers,
-          'Referer': new URL(redirectUrl).origin,
-          'Origin': new URL(redirectUrl).origin,
-        }
-      });
-      redirectCount++;
-    }
+    // Note: Playwright auto-handles redirects, so we don't need manual redirect handling
+    // The response.url will contain the final URL after all redirects
+    decodedUrl = response.url;
     
     // Store any cookies from the response
     const setCookieHeader = response.headers.raw()['set-cookie'];
@@ -1884,7 +1983,12 @@ app.post('/session', (req, res) => {
 });
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+  res.json({ 
+    status: 'ok', 
+    timestamp: new Date().toISOString(),
+    browsers: browserPool.length,
+    uptime: process.uptime()
+  });
 });
 
 // Explicitly serve the Nounspace toggle test page to avoid proxy catch-all
@@ -2034,7 +2138,7 @@ app.use(async (req, res, next) => {
       'Origin': targetOrigin,
     };
     
-    const response = await fetch(targetUrl, { headers, redirect: 'follow' });
+    const response = await fetchWithBrowser(targetUrl, { headers });
     
     // Check if the response is HTML (might be a soft 404 or redirect)
     const contentType = response.headers.get('content-type') || '';
@@ -2087,11 +2191,16 @@ app.use(async (req, res, next) => {
   }
 });
 
-// Start server
-app.listen(PORT, () => {
-  console.log(`🔓 Iframe Bypass Proxy running on http://localhost:${PORT}`);
-  console.log(`📝 Usage: /proxy?url=<encoded-url>`);
-  console.log(`💚 Health: /health`);
-});
+// Start server (with browser pool initialization)
+(async () => {
+  await initBrowserPool();
+  
+  app.listen(PORT, () => {
+    console.log(`🔓 Iframe Bypass Proxy running on http://localhost:${PORT}`);
+    console.log(`📝 Usage: /proxy?url=<encoded-url>`);
+    console.log(`💚 Health: /health`);
+    console.log(`🌐 Browser pool: ${browserPool.length} instances ready`);
+  });
+})();
 
 module.exports = app;
